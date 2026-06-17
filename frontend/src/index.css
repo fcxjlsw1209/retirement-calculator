@@ -1,0 +1,25 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:      #0E0E0E;
+  --surface: #161616;
+  --raised:  #1F1F1F;
+  --border:  #2A2826;
+  --text:    #E8E0D0;
+  --muted:   #6B6460;
+  --gain:    #C8A96E;
+  --loss:    #C06B5A;
+}
+
+body {
+  font-family: 'Space Grotesk', -apple-system, BlinkMacSystemFont, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+button {
+  cursor: pointer;
+  font-family: inherit;
+}

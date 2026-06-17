@@ -1,0 +1,33 @@
+services:
+  retirement-calculator-frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: retirement-calculator-frontend
+    expose:
+      - "80"
+    depends_on:
+      - retirement-calculator-backend
+    networks:
+      - retirement-calculator-internal
+      - shared-web
+
+  retirement-calculator-backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: retirement-calculator-backend
+    volumes:
+      - retirement-calculator_data:/root/.retirement-calculator
+    env_file:
+      - backend/.env
+    networks:
+      - retirement-calculator-internal
+
+volumes:
+  retirement-calculator_data:
+
+networks:
+  retirement-calculator-internal:
+  shared-web:
+    external: true
