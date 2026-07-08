@@ -17,6 +17,7 @@ export default function App() {
   const [attribution, setAttribution] = useState<Attribution | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [syncLogOpen, setSyncLogOpen] = useState(false)
+  const [priceRefreshing, setPriceRefreshing] = useState(false)
   const [hidden, setHidden] = useState(true)
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -133,6 +134,27 @@ export default function App() {
             title="按 H 键切换"
           >
             {hidden ? '● ● ●' : '显示中'}
+          </button>
+          <button
+            onClick={async () => {
+              setPriceRefreshing(true)
+              try { await api.priceRefresh(); await loadData() } finally { setPriceRefreshing(false) }
+            }}
+            disabled={priceRefreshing}
+            style={{
+              background: 'none',
+              border: '1px solid rgba(200,169,110,0.3)',
+              borderRadius: 4,
+              cursor: priceRefreshing ? 'default' : 'pointer',
+              fontSize: 11,
+              color: priceRefreshing ? '#6B6460' : '#C8A96E',
+              fontFamily: "'JetBrains Mono', monospace",
+              padding: '3px 8px',
+              opacity: priceRefreshing ? 0.5 : 1,
+              transition: 'opacity 0.1s',
+            }}
+          >
+            {priceRefreshing ? '刷新中…' : '刷新价格'}
           </button>
           <button
             onClick={() => setSyncLogOpen(o => !o)}

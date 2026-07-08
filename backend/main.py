@@ -227,6 +227,13 @@ async def sync(skip_empower: bool = False):
     return SyncResponse(reauth_required=False, sources=sources)
 
 
+@app.post("/api/price-refresh")
+def price_refresh():
+    """Fetch latest market prices and update holdings/accounts without a new Empower scrape."""
+    from backend.price_refresh import run_price_refresh
+    return run_price_refresh()
+
+
 @app.post("/api/ingest")
 def ingest_data(body: IngestRequest):
     """

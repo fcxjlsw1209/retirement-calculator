@@ -114,6 +114,8 @@ function HoldingsTable({ holdings, showAccount, firmMap, portfolioTotal, hidden 
         <tr style={{ background: '#0E0E0E' }}>
           <th style={thStyle('left')}>名称</th>
           {showAccount && <th style={thStyle('left')}>账户</th>}
+          <th style={thStyle('right')}>股数</th>
+          <th style={thStyle('right')}>单价</th>
           <th style={thStyle('right')}>市值</th>
         </tr>
       </thead>
@@ -123,6 +125,8 @@ function HoldingsTable({ holdings, showAccount, firmMap, portfolioTotal, hidden 
           const firmKey = digits ? `${h.source}::${digits[1]}` : `${h.source}::${h.account_name ?? ''}`
           const firmLabel = firmMap?.get(firmKey) ?? SOURCE_LABEL[h.source] ?? h.source
           const pct = portfolioTotal && portfolioTotal > 0 ? h.value_usd / portfolioTotal : null
+          const price = h.shares && h.shares > 0 ? h.value_usd / h.shares : null
+          const monoGray: React.CSSProperties = { fontFamily: "'JetBrains Mono', monospace", color: '#9A9490', fontSize: 11 }
           return (
             <tr key={i} style={{ borderTop: '1px solid #2A2826' }}>
               <td style={{ padding: '8px 12px' }}>
@@ -140,6 +144,12 @@ function HoldingsTable({ holdings, showAccount, firmMap, portfolioTotal, hidden 
                     : firmLabel}
                 </td>
               )}
+              <td style={{ padding: '8px 12px', textAlign: 'right', ...monoGray }}>
+                {h.shares != null ? h.shares.toLocaleString('en-US', { maximumFractionDigits: 4 }) : '—'}
+              </td>
+              <td style={{ padding: '8px 12px', textAlign: 'right', ...monoGray }}>
+                {price != null ? '$' + price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—'}
+              </td>
               <td style={{ padding: '8px 12px', textAlign: 'right', fontFamily: "'JetBrains Mono', monospace", fontWeight: 500 }}>
                 {fmtOrMask(h.value_usd, hidden)}
                 {pct !== null && (

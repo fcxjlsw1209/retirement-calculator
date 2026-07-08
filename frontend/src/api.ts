@@ -281,6 +281,11 @@ export const api = {
     clearReadCache()
     return result
   },
+  priceRefresh: async () => {
+    const result = await request<{ status: string; prices_updated: number; total_value_usd: number }>('/price-refresh', { method: 'POST' })
+    clearReadCache()
+    return result
+  },
   portfolio: {
     get: () => cachedRequest<Portfolio>('/portfolio', TTL.portfolio),
     history: (from?: string, to?: string) => {
