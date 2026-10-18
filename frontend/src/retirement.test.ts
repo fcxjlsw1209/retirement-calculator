@@ -1,6 +1,8 @@
+import { HISTORICAL_RETURNS } from './historicalReturns'
 import { describe, it, expect } from 'vitest'
 import {
   runMonteCarlo,
+  fitSpendingPhases,
   computeHoldingWeights,
   computePlanningRequired,
   checkBridgeGap,
@@ -429,4 +431,97 @@ describe('ASSET_PARAMS', () => {
     expect(ASSET_PARAMS.individual_stock.std).toBeGreaterThan(ASSET_PARAMS.equity.std)
     expect(ASSET_PARAMS.intl_stock.std).toBeGreaterThan(ASSET_PARAMS.international.std)
   })
+})
+
+
+describe('retirement audit regressions', () => {
+  it('reproduces the same paths for the same seed', () => {
+    const params = { ...BASE_PARAMS, simCount: 100, seed: 42 }
+    expect(runMonteCarlo(params)).toEqual(runMonteCarlo(params))
+    expect(runMonteCarlo({ ...params, seed: 43 }).p50).not.toEqual(runMonteCarlo(params).p50)
+  })
+  it('never silently cuts the first planned withdrawal on an underfunded path', () => {
+    const result = runMonteCarlo({ ...BASE_PARAMS, currentAge: 65, retirementAge: 65, maxAge: 67,
+      taxableBalance: 1000, retirementBalance: 0, monthlyContribution: 0,
+      spendingPhases: makePhases(65, 67, 100), simCount: 100 })
+    expect(result.successRate).toBe(0)
+    expect(result.p90[1]).toBe(0) // The first $1,200 payment cannot be funded by $1,000.
+  })
+  it('grosses up the reference gap by the same tax rate as withdrawals', () => {
+    const result = runMonteCarlo({ ...BASE_PARAMS, currentAge: 65, retirementAge: 65, maxAge: 66,
+      taxableBalance: 0, retirementBalance: 0, monthlyContribution: 0, effectiveTaxRate: 0.25,
+      spendingPhases: makePhases(65, 66, 1000), simCount: 10 })
+    expect(result.medianGapToRetirement).toBe(16000)
+  })
+  it('keeps property out of spendable balances until explicitly included', () => {
+    const asset = { id: 'home', name: 'Home', value: 500000, mean: 0.03, std: 0.1 }
+    const params = { ...BASE_PARAMS, customAssets: [asset], simCount: 10 }
+    expect(runMonteCarlo(params).p50[0]).toBe(500000)
+    expect(runMonteCarlo({ ...params, customAssets: [{ ...asset, availableForSpending: true }] }).p50[0]).toBe(1000000)
+  })
+  it('reports retirement account access needed before age 60', () => {
+    const result = runMonteCarlo({ ...BASE_PARAMS, currentAge: 55, retirementAge: 55, maxAge: 56,
+      taxableBalance: 0, retirementBalance: 100000, monthlyContribution: 0,
+      spendingPhases: makePhases(55, 56, 100), simCount: 10 })
+    expect(result.successRate).toBe(1)
+    expect(result.earlyWithdrawalRate).toBe(1)
+  })
+  it('applies the configured individual-stock volatility, not fund volatility', () => {
+    const params = { ...BASE_PARAMS, currentAge: 40, retirementAge: 41, maxAge: 42,
+      taxableBalance: 100000, retirementBalance: 0, monthlyContribution: 0, spendingPhases: [], simCount: 5000 }
+    const fund = runMonteCarlo({ ...params, holdingWeights: { equity: 1 } })
+    const stock = runMonteCarlo({ ...params, holdingWeights: { individual_stock: 1 } })
+    expect((stock.p90[1] - stock.p10[1]) / (fund.p90[1] - fund.p10[1])).toBeCloseTo(0.32 / 0.15, 6)
+  })
+  it('rejects invalid inputs instead of returning misleading or non-finite results', () => {
+    expect(() => runMonteCarlo({ ...BASE_PARAMS, simCount: 0 })).toThrow()
+    expect(() => runMonteCarlo({ ...BASE_PARAMS, effectiveTaxRate: 1 })).toThrow()
+    expect(() => runMonteCarlo({ ...BASE_PARAMS, monthlyContribution: -1 })).toThrow()
+  })
+  it('uses dated, contiguous history and preserves the 2022 stock/bond drawdown', () => {
+    expect(HISTORICAL_RETURNS.map(r => r[0])).toEqual(Array.from({ length: 98 }, (_, i) => 1928 + i))
+    const [, equity, bond, inflation] = HISTORICAL_RETURNS.find(r => r[0] === 2022)!
+    expect(equity).toBeCloseTo(-0.180375, 6)
+    expect(bond).toBeCloseTo(-0.178282, 6)
+    expect((1 + equity) / (1 + inflation) - 1).toBeCloseTo(-0.230069, 6)
+    expect((1 + bond) / (1 + inflation) - 1).toBeCloseTo(-0.228103, 6)
+    expect(HISTORICAL_RETURNS.every(r => r.every(Number.isFinite))).toBe(true)
+  })
+})
+
+
+describe('annual cash-flow consistency', () => {
+  it('uses same-year social security surplus toward lump-sum expenses', () => {
+    const result = runMonteCarlo({ ...BASE_PARAMS, currentAge: 65, retirementAge: 65, maxAge: 66,
+      taxableBalance: 0, retirementBalance: 0, monthlyContribution: 0, simCount: 10,
+      socialSecurity: [{ startAge: 65, monthlyBenefit: 1000 }],
+      spendingPhases: [{ id: 'p', label: 'One-time expense', startAge: 65, endAge: 66,
+        items: [{ id: 'l', label: 'Expense', monthlySpend: 0, isLumpSum: true, lumpSumAge: 65, lumpSumAmount: 12000 }] }] })
+    expect(result.successRate).toBe(1)
+    expect(result.medianGapToRetirement).toBe(0)
+  })
+  it('keeps a failed path at zero instead of adding contributions without returns', () => {
+    const result = runMonteCarlo({ ...BASE_PARAMS, currentAge: 40, retirementAge: 42, maxAge: 43,
+      taxableBalance: 0, retirementBalance: 0, monthlyContribution: 100, simCount: 10,
+      spendingPhases: [{ id: 'p', label: 'Expense', startAge: 40, endAge: 43,
+        items: [{ id: 'l', label: 'Expense', monthlySpend: 0, isLumpSum: true, lumpSumAge: 40, lumpSumAmount: 10000 }] }] })
+    expect(result.p50).toEqual([0, 0, 0, 0])
+  })
+  it('preserves all stage budgets when moving retirement past an old boundary', () => {
+    const phases = [...makePhases(65, 75, 3000), { ...makePhases(75, 90, 4000)[0], id: '2' }]
+    const fitted = fitSpendingPhases(phases, 80, 90)
+    expect(fitted.map(p => [p.startAge, p.endAge])).toEqual([[80, 81], [81, 90]])
+    expect(fitted.map(p => p.items)).toEqual(phases.map(p => p.items))
+    expect(phases[0].startAge).toBe(65)
+  })
+})
+
+it('keeps the pre-60 bridge in real dollars and includes income and lump sums', () => {
+  const phases = [{ ...makePhases(55, 60, 1000)[0], items: [
+    { id: 'r', label: 'Recurring', monthlySpend: 1000 },
+    { id: 'l', label: 'Lump sum', monthlySpend: 0, isLumpSum: true, lumpSumAge: 59, lumpSumAmount: 2000 },
+  ] }]
+  const result = checkBridgeGap({ ...BASE_PARAMS, currentAge: 50, retirementAge: 58,
+    socialSecurity: [{ startAge: 58, monthlyBenefit: 500 }], effectiveTaxRate: 0.2 }, phases)
+  expect(result.pre60Cost).toBe((2 * 6000 + 2000) / 0.8)
 })

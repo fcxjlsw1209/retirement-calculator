@@ -13,6 +13,8 @@ const MARKET_PULSE_PREFETCH_TIMEOUT_MS = 3_000
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('portfolio')
+  const [retirementVisited, setRetirementVisited] = useState(false)
+  const [priceNotice, setPriceNotice] = useState('')
   const [portfolio, setPortfolio] = useState<Portfolio | null>(null)
   const [attribution, setAttribution] = useState<Attribution | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -82,16 +84,18 @@ export default function App() {
   }, [tab])
 
   return (
-    <div style={{ maxWidth: 960, margin: '0 auto', padding: '0 16px' }}>
+    <div onPointerDown={() => { if (!hidden) scheduleHide() }} onKeyDown={() => { if (!hidden) scheduleHide() }} style={{ maxWidth: 960, margin: '0 auto', padding: '0 16px' }}>
       <header style={{
         display: 'flex',
+        flexWrap: 'wrap',
+        gap: 16,
         justifyContent: 'space-between',
         alignItems: 'center',
         padding: '20px 0 16px',
         borderBottom: '1px solid #2A2826',
         marginBottom: 24,
       }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
           <span style={{ fontSize: 15, fontWeight: 700, color: '#C8A96E', letterSpacing: '0.02em' }}>
             Retirement Calculator
           </span>
@@ -99,13 +103,14 @@ export default function App() {
             {([['portfolio', '投资组合'], ['market-pulse', '大盘脉搏'], ['retirement', '退休计算']] as [Tab, string][]).map(([t, label]) => (
               <button
                 key={t}
-                onClick={() => setTab(t)}
+                onClick={() => { setTab(t); if (t === 'retirement') setRetirementVisited(true) }}
                 style={{
                   background: 'none',
                   border: 'none',
                   borderBottom: `2px solid ${tab === t ? '#C8A96E' : 'transparent'}`,
                   cursor: 'pointer',
                   fontSize: 13,
+                  whiteSpace: 'nowrap',
                   fontFamily: "'Space Grotesk', sans-serif",
                   color: tab === t ? '#E8E0D0' : '#6B6460',
                   padding: '4px 10px',
@@ -138,7 +143,14 @@ export default function App() {
           <button
             onClick={async () => {
               setPriceRefreshing(true)
-              try { await api.priceRefresh(); await loadData() } finally { setPriceRefreshing(false) }
+              setError(null)
+              setPriceNotice('')
+              try {
+                const result = await api.priceRefresh()
+                await loadData()
+                setPriceNotice(`已更新 ${result.prices_updated} 项持仓报价，${result.prices_skipped} 项暂无报价。账户余额与收益记录仍以同步数据为准。`)
+              } catch (e) { setError(e instanceof Error ? e.message : '行情刷新失败') }
+              finally { setPriceRefreshing(false) }
             }}
             disabled={priceRefreshing}
             style={{
@@ -174,7 +186,8 @@ export default function App() {
         </div>
       </header>
 
-      <SyncLogPanel open={syncLogOpen} />
+      {hidden && syncLogOpen ? <p style={{ color: '#6B6460' }}>显示金额后查看同步记录。</p> : <SyncLogPanel open={syncLogOpen} />}
+      {priceNotice && <p role="status" style={{ color: '#6B6460', fontSize: 12 }}>{priceNotice}</p>}
 
       {error && (
         <div style={{
@@ -209,11 +222,11 @@ export default function App() {
       {tab === 'portfolio' && (
         <>
           {portfolio && <PortfolioView portfolio={portfolio} hidden={hidden} />}
-          {attribution && <AttributionPanel attribution={attribution} />}
+          {attribution && !hidden && <AttributionPanel attribution={attribution} />}
         </>
       )}
       {tab === 'market-pulse' && <MarketPulseView />}
-      {tab === 'retirement' && <RetirementCalculator hidden={hidden} />}
+      {retirementVisited && <div style={{ display: tab === 'retirement' ? 'block' : 'none' }}><RetirementCalculator hidden={hidden} /></div>}
     </div>
   )
 }

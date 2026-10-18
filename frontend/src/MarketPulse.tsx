@@ -392,7 +392,7 @@ function DecisionStrip({
             textTransform: 'uppercase',
             letterSpacing: '0.08em',
             marginBottom: 6,
-          }}>Decision Strip</div>
+          }}>市场通用节奏</div>
           <div style={{
             display: 'flex',
             alignItems: 'baseline',
@@ -432,7 +432,7 @@ function DecisionStrip({
         color: '#E8E0D0',
         lineHeight: 1.65,
       }}>
-        新增资金：{newMoneyCopy(data.recommendation)}
+        宽基市场参考：{newMoneyCopy(data.recommendation)}具体加仓对象仍需遵守下方个人配置约束。
       </div>
 
       <div style={{
@@ -810,6 +810,7 @@ export default function MarketPulseView() {
       )}
 
       <DecisionStrip data={confluence} marketDate={data.market_date} stale={stale} />
+      {notices.length > 0 && <AllocationSummary notices={notices} />}
 
       <div style={{ display: 'flex', gap: 12, marginBottom: 20, flexWrap: 'wrap' }}>
         {SIGNAL_META.map(({ key, label, invertDeltaColor }) => {
@@ -852,7 +853,6 @@ export default function MarketPulseView() {
             letterSpacing: '0.08em',
             marginBottom: 12,
           }}>个人持仓信号</div>
-          <AllocationSummary notices={notices} />
           {notices.map((n, i) => <NoticeCard key={i} notice={n} />)}
         </div>
       )}

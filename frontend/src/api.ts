@@ -27,6 +27,9 @@ export interface Holding {
   name?: string
   value_usd: number
   shares?: number
+  market_price?: number | null
+  market_value_usd?: number | null
+  market_date?: string | null
   gain_usd?: number
   gain_pct?: number
   source: string
@@ -282,7 +285,8 @@ export const api = {
     return result
   },
   priceRefresh: async () => {
-    const result = await request<{ status: string; prices_updated: number; total_value_usd: number }>('/price-refresh', { method: 'POST' })
+    const result = await request<{ status: string; prices_updated: number; prices_skipped: number; detail?: string }>('/price-refresh', { method: 'POST' })
+    if (result.status !== 'ok') throw new Error(result.detail ?? '行情刷新失败')
     clearReadCache()
     return result
   },

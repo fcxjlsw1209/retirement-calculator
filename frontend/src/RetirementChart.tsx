@@ -98,16 +98,7 @@ export default function RetirementChart({ result, retirementAge }: Props) {
       {/* Chart */}
       <ResponsiveContainer width="100%" height={260}>
         <ComposedChart data={data} margin={{ top: 8, right: 12, left: -8, bottom: 0 }}>
-          <defs>
-            <linearGradient id="grad-p90" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%" stopColor="#C8A96E" stopOpacity={0.12} />
-              <stop offset="95%" stopColor="#C8A96E" stopOpacity={0} />
-            </linearGradient>
-            <linearGradient id="grad-p10" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%" stopColor="#C06B5A" stopOpacity={0.08} />
-              <stop offset="95%" stopColor="#C06B5A" stopOpacity={0} />
-            </linearGradient>
-          </defs>
+
 
           <CartesianGrid stroke="#1E1C1A" strokeDasharray="3 3" vertical={false} />
 
@@ -151,7 +142,7 @@ export default function RetirementChart({ result, retirementAge }: Props) {
             dataKey="p90"
             stroke="#C8A96E"
             strokeWidth={1.5}
-            fill="url(#grad-p90)"
+            fill="#C8A96E" fillOpacity={0.08}
             dot={false}
             activeDot={false}
             name="90分位"
@@ -175,7 +166,7 @@ export default function RetirementChart({ result, retirementAge }: Props) {
             dataKey="p10"
             stroke="#C06B5A"
             strokeWidth={1.5}
-            fill="url(#grad-p10)"
+            fill="#C06B5A" fillOpacity={0.08}
             dot={false}
             activeDot={false}
             name="10分位"
@@ -214,7 +205,7 @@ export function YearlyTable({ result, retirementAge }: YearlyTableProps) {
   // Show every year when expanded, every 5 years when collapsed
   const rows = ages
     .map((age, i) => ({ age, p10: p10[i], p50: p50[i], p90: p90[i] }))
-    .filter((_, i) => expanded ? true : i % 5 === 0 || ages[i] === retirementAge)
+    .filter((_, i) => expanded ? true : i % 5 === 0 || ages[i] === retirementAge || i === ages.length - 1)
 
   const thStyle: React.CSSProperties = {
     fontSize: 10,
@@ -293,95 +284,22 @@ export function YearlyTable({ result, retirementAge }: YearlyTableProps) {
 
 // ─── OutputCards ──────────────────────────────────────────────────────────────
 
-const RETIREMENT_SUCCESS_THRESHOLD = 0.80
-
 interface OutputCardsProps {
   result: MonteCarloResult
-  monthlyContribution: number
+  retirementAge: number
 }
 
-export function OutputCards({ result, monthlyContribution }: OutputCardsProps) {
-  const { medianGapToRetirement, yearsToRetirement, successRate } = result
-  const alreadyReady = successRate >= RETIREMENT_SUCCESS_THRESHOLD
-
-  const cardStyle: React.CSSProperties = {
-    background: '#161616',
-    border: '1px solid #2A2826',
-    borderRadius: 8,
-    padding: '16px 20px',
-    flex: 1,
-  }
-
-  const labelStyle: React.CSSProperties = {
-    fontSize: 10,
-    color: '#6B6460',
-    fontFamily: "'JetBrains Mono', monospace",
-    letterSpacing: '0.08em',
-    textTransform: 'uppercase',
-    marginBottom: 6,
-  }
-
-  const valueStyle: React.CSSProperties = {
-    fontSize: 22,
-    fontFamily: "'JetBrains Mono', monospace",
-    fontWeight: 500,
-    letterSpacing: '-0.02em',
-  }
-
-  const subStyle: React.CSSProperties = {
-    fontSize: 11,
-    color: '#6B6460',
-    fontFamily: "'Space Grotesk', sans-serif",
-    marginTop: 4,
-  }
-
-  return (
-    <div style={{ display: 'flex', gap: 12, marginTop: 16 }}>
-      {/* Gap card */}
-      <div style={cardStyle}>
-        <div style={labelStyle}>距离目标</div>
-        {alreadyReady ? (
-          <>
-            <div style={{ ...valueStyle, color: '#C8A96E' }}>已达目标 ✓</div>
-            <div style={subStyle}>成功率已达安全基准（≥80%）</div>
-          </>
-        ) : (
-          <>
-            <div style={{ ...valueStyle, color: '#E8E0D0' }}>
-              还差 {fmtMoneyFull(medianGapToRetirement)}
-            </div>
-            <div style={subStyle}>中位数场景，退休当年仍需积累此金额</div>
-          </>
-        )}
-      </div>
-
-      {/* Years card */}
-      <div style={cardStyle}>
-        <div style={labelStyle}>预计可退休</div>
-        {alreadyReady ? (
-          <>
-            <div style={{ ...valueStyle, color: '#C8A96E' }}>现在即可退休</div>
-            <div style={subStyle}>按当前投入速度，已满足退休资产门槛</div>
-          </>
-        ) : yearsToRetirement !== null ? (
-          <>
-            <div style={{ ...valueStyle, color: '#E8E0D0' }}>约 {yearsToRetirement} 年后</div>
-            <div style={subStyle}>
-              按每月 {fmtMoneyFull(monthlyContribution)} 继续投入
-            </div>
-          </>
-        ) : successRate >= 0.60 ? (
-          <>
-            <div style={{ ...valueStyle, color: '#E8E0D0' }}>持续积累中</div>
-            <div style={subStyle}>成功率 {Math.round(successRate * 100)}%，继续保持投入</div>
-          </>
-        ) : (
-          <>
-            <div style={{ ...valueStyle, color: '#C06B5A' }}>目标较远</div>
-            <div style={subStyle}>按当前投入，退休年龄前难以达到目标</div>
-          </>
-        )}
-      </div>
-    </div>
-  )
+export function OutputCards({ result, retirementAge }: OutputCardsProps) {
+  const cards = [
+    ['计划退休年龄', `${retirementAge} 岁`, '按此年龄之前持续投入、之后开始支出计算'],
+    ['完整预算成功率', `${Math.round(result.successRate * 100)}%`, '整个规划期内能够支付全部预算的模拟比例'],
+    ['退休当年参考缺口', fmtMoneyFull(result.medianGapToRetirement), '按资产中位数与平均回报折现预算比较'],
+  ]
+  return <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', margin: '16px 0' }}>
+    {cards.map(([label, value, detail]) => <div key={label} style={{ background: '#161616', border: '1px solid #2A2826', borderRadius: 8, padding: 16, flex: '1 1 200px' }}>
+      <div style={{ fontSize: 11, color: '#6B6460', marginBottom: 8 }}>{label}</div>
+      <div style={{ fontSize: 22, color: '#C8A96E', fontFamily: "'JetBrains Mono', monospace" }}>{value}</div>
+      <div style={{ fontSize: 11, color: '#6B6460', marginTop: 8 }}>{detail}</div>
+    </div>)}
+  </div>
 }

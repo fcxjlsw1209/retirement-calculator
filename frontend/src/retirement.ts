@@ -1,4 +1,5 @@
 import type { Holding } from './api'
+import { HISTORICAL_RETURNS } from './historicalReturns'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -45,12 +46,26 @@ export function phaseLumpSums(phase: SpendingPhase): SpendingItem[] {
   return phase.items.filter(item => item.isLumpSum && (item.lumpSumAmount ?? 0) > 0)
 }
 
+// Preserve every phase and its budget when the planning range changes.
+export function fitSpendingPhases(phases: SpendingPhase[], startAge: number, endAge: number): SpendingPhase[] {
+  if (!phases.length || endAge - startAge < phases.length) return phases
+  let start = startAge
+  return phases.map((phase, i) => {
+    const end = i === phases.length - 1 ? endAge
+      : Math.max(start + 1, Math.min(phase.endAge, endAge - (phases.length - i - 1)))
+    const next = { ...phase, startAge: start, endAge: end }
+    start = end
+    return next
+  })
+}
+
 export interface CustomAsset {
   id: string
   name: string
   value: number   // current market value in USD
   mean: number    // annual real return, e.g. 0.05
   std: number     // annual std dev, e.g. 0.12
+  availableForSpending?: boolean // explicit consent to treat as liquid and rebalance at retirement
 }
 
 export interface SocialSecurity {
@@ -72,6 +87,7 @@ export interface RetirementParams {
   effectiveTaxRate: number  // blended withdrawal tax rate, default 0.22
   spendingPhases: SpendingPhase[]
   simCount: number          // default 1000
+  seed?: number             // stable by default; scenarios use common annual draws
   postRetirementEquityPct?: number  // 0–1; fraction of portfolio kept in equity after retirement
 }
 
@@ -80,22 +96,23 @@ export interface MonteCarloResult {
   p50: number[]             // 50th percentile
   p90: number[]             // 90th percentile
   ages: number[]
+  earlyWithdrawalRate: number // paths requiring retirement account access before age 60
   successRate: number       // fraction of sims where portfolio never depletes (excludes planned phases)
   medianGapToRetirement: number  // max(0, threshold - p50 at retirementAge)
-  yearsToRetirement: number | null  // null = already ready; null also if unreachable (check medianGapToRetirement)
+  yearsToRetirement: number | null  // additional contribution years before coasting to the fixed retirement age, not an earliest retirement date
 }
 
 export interface BridgeGapResult {
   ok: boolean
   taxableAtRetirement: number   // projected taxable account balance at retirementAge
-  pre60Cost: number             // sum of unplanned pre-60 nominal spending (inflation + tax grossed up)
+  pre60Cost: number             // pre-60 net spending in today's dollars, tax grossed up
   shortfall: number             // max(0, pre60Cost - taxableAtRetirement)
 }
 
 // ─── Return parameters (real annual returns, inflation-adjusted) ───────────────
 
 export const ASSET_PARAMS: Record<AssetClass, { mean: number; std: number }> = {
-  equity:           { mean: 0.07,  std: 0.15  },  // S&P 500 historical
+  equity:           { mean: 0.07,  std: 0.15  },  // scenario assumption; historical shocks are rescaled
   tech_fund:        { mean: 0.10,  std: 0.22  },  // QQQ/VGT: higher return, more volatile
   small_cap:        { mean: 0.09,  std: 0.20  },  // small cap premium
   individual_stock: { mean: 0.09,  std: 0.32  },  // single stock: ~2× fund volatility
@@ -104,167 +121,84 @@ export const ASSET_PARAMS: Record<AssetClass, { mean: number; std: number }> = {
   bond:             { mean: 0.02,  std: 0.05  },
   cash:             { mean: 0.005, std: 0.005 },
   crypto:           { mean: 0.12,  std: 0.75  },  // BTC/ETH historical
-  gold:             { mean: 0.04,  std: 0.18  },  // long-run real return ~1%, nominal ~4%
+  gold:             { mean: 0.04,  std: 0.18  },  // scenario assumption, real return
   alternative:      { mean: 0.04,  std: 0.12  },  // commodities / managed futures
   blended:          { mean: 0.06,  std: 0.12  },  // target date, thematic, unknown
 }
 
-// ─── Historical bootstrap data ────────────────────────────────────────────────
-// S&P 500 real (inflation-adjusted) annual returns, 1928–2024 (97 years).
-// Source: Damodaran NYU. Already inflation-adjusted (real returns).
-const SP500_REAL: number[] = [
-  0.4381,-0.0830,-0.2512,-0.4384,-0.0864, 0.4974,-0.0119, 0.4674, 0.3194,-0.3517,
-  0.2920, 0.2234, 0.1967, 0.2513,-0.0010, 0.1992, 0.3164,-0.0656, 0.1869, 0.3159,
-  0.2269,-0.0964, 0.2373, 0.1106,-0.0843, 0.2041, 0.0578, 0.1603, 0.5681,-0.0873,
-  0.2961, 0.2313, 0.1906, 0.1496,-0.0847, 0.0598, 0.5548, 0.3261, 0.0258, 0.2373,
-  0.1100,-0.1267, 0.2368, 0.1006, 0.2398, 0.1089, 0.0973, 0.2381,-0.0698, 0.0664,
-  0.1853, 0.3227, 0.2869,-0.0121, 0.2197, 0.2225, 0.0628, 0.3286, 0.2834, 0.2089,
- -0.0903,-0.1181,-0.2197, 0.2868, 0.1088, 0.0491, 0.1561, 0.0529,-0.3700, 0.2646,
-  0.1506, 0.0211, 0.1541, 0.3239, 0.1369, 0.0138, 0.1196, 0.2183, 0.2844, 0.1269,
- -0.0610,-0.1951,-0.2359, 0.2869, 0.1088, 0.0491, 0.1561, 0.0529,-0.3700, 0.2646,
-  0.1506, 0.0211, 0.1541, 0.3239, 0.1369, 0.0138,  0.2180,
-]
+// Paired real annual returns preserve equity/bond dependence. Means and standard
+// deviations below are scenario assumptions, not forecasts inferred from history.
+const SP500_REAL = HISTORICAL_RETURNS.map(([, equity, , inflation]) => (1 + equity) / (1 + inflation) - 1)
+const BOND10_REAL = HISTORICAL_RETURNS.map(([, , bond, inflation]) => (1 + bond) / (1 + inflation) - 1)
+function standardized(values: number[]): number[] {
+  const mean = values.reduce((sum, n) => sum + n, 0) / values.length
+  const std = Math.sqrt(values.reduce((sum, n) => sum + (n - mean) ** 2, 0) / values.length)
+  return values.map(n => (n - mean) / std)
+}
+const EQUITY_Z = standardized(SP500_REAL)
+const BOND_Z = standardized(BOND10_REAL)
 
-// 10-Year Treasury real returns (same years, approximate)
-const BOND10_REAL: number[] = [
-  0.0084, 0.0422, 0.0097,-0.0228,-0.0289, 0.0780, 0.0436, 0.0517, 0.0418, 0.0298,
-  0.0330, 0.0148, 0.0440, 0.0526, 0.0163, 0.0296,-0.0215, 0.0228,-0.0162, 0.0398,
-  0.0064, 0.0516,-0.0105, 0.0261, 0.0628, 0.0350, 0.0049, 0.0058, 0.0063,-0.0247,
-  0.0481, 0.0355, 0.0172, 0.0287,-0.0181,-0.0006, 0.0342, 0.0350, 0.0116, 0.0253,
-  0.0200,-0.0049, 0.0217, 0.0157, 0.0320, 0.0320, 0.0180, 0.0315,-0.0068, 0.0282,
-  0.0399, 0.0154, 0.0299,-0.0049, 0.0233, 0.0198, 0.0041, 0.0329, 0.0403, 0.0196,
- -0.0041, 0.1046, 0.0400, 0.0280, 0.0164, 0.0298, 0.0162, 0.0298,-0.0180, 0.1127,
-  0.0849, 0.1646, 0.0297,-0.0110, 0.0278, 0.0313, 0.0025, 0.0140, 0.0279,-0.0183,
-  0.1000, 0.0280, 0.0414, 0.0280, 0.0164, 0.0298, 0.0162, 0.0298,-0.0180, 0.1127,
-  0.0849, 0.1646, 0.0297,-0.0110, 0.0278, 0.0313, 0.0025,
-]
-
-const HIST_N = SP500_REAL.length
-
-// Draw a random historical year index
-function randHistYear(): number {
-  return Math.floor(Math.random() * HIST_N)
+type Random = () => number
+function seededRandom(seed: number): Random {
+  let state = seed >>> 0
+  return () => {
+    state += 0x6D2B79F5
+    let t = Math.imul(state ^ (state >>> 15), 1 | state)
+    t ^= t + Math.imul(t ^ (t >>> 7), 61 | t)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+function randn(random: Random): number {
+  const u = 1 - random()
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * random())
+}
+function drawHistoricalYear(random: Random) {
+  const idx = Math.floor(random() * EQUITY_Z.length)
+  return { zEquity: EQUITY_Z[idx], zBond: BOND_Z[idx] }
 }
 
-// ─── Private helpers ──────────────────────────────────────────────────────────
-
-// Box-Muller polar form for standard normal samples
-function randn(): number {
-  let u = 0, v = 0, s = 0
-  do {
-    u = Math.random() * 2 - 1
-    v = Math.random() * 2 - 1
-    s = u * u + v * v
-  } while (s >= 1 || s === 0)
-  return u * Math.sqrt(-2 * Math.log(s) / s)
-}
-
-// ─── Bootstrap return sampler ─────────────────────────────────────────────────
-// For each simulation year, sample a random historical year.
-// equity/bond use historical returns directly.
-// Other asset classes use their ASSET_PARAMS mean/std but scaled by the
-// equity z-score from that year (preserving cross-asset correlation structure).
-// inflationAdj shifts all returns for the user's inflation assumption.
-
-interface HistoricalDraw {
-  equity: number   // SP500 real return for that year
-  bond: number     // 10Y Treasury real return
-  zEquity: number  // standardized z-score of SP500 return (for scaling other assets)
-}
-
-function drawHistoricalYear(inflationAdj: number): HistoricalDraw {
-  const idx = randHistYear()
-  const equity = SP500_REAL[idx] + inflationAdj
-  const bond   = BOND10_REAL[idx] + inflationAdj
-  // Standardize SP500 return to get a z-score for scaling other asset classes
-  const spMean = SP500_REAL.reduce((s, r) => s + r, 0) / HIST_N
-  const spStd  = Math.sqrt(SP500_REAL.reduce((s, r) => s + (r - spMean) ** 2, 0) / HIST_N)
-  const zEquity = spStd > 0 ? (SP500_REAL[idx] - spMean) / spStd : 0
-  return { equity, bond, zEquity }
-}
-
-// Generate a portfolio return for a given asset class mix using bootstrap.
-// equity/bond use historical draws; others use parametric with equity z-score correlation.
 function bootstrapPortfolioReturn(
   weights: AssetClassWeights,
   customAssets: CustomAsset[],
   portfolioValue: number,
   customTotal: number,
   inflationAdj: number,
+  random: Random,
 ): number {
-  const { equity: histEquity, bond: histBond, zEquity } = drawHistoricalYear(inflationAdj)
+  const { zEquity, zBond } = drawHistoricalYear(random)
   const grandTotal = portfolioValue + customTotal
-  if (grandTotal <= 0) return histEquity
-
-  const holdingWeight = Object.values(weights).reduce((s, w) => s + (w ?? 0), 0)
-  const portfolioShare = holdingWeight > 0 ? portfolioValue / grandTotal : 0
-
+  const effectiveWeights = Object.values(weights).some(w => (w ?? 0) > 0) ? weights : { blended: 1 }
+  const holdingWeight = Object.values(effectiveWeights).reduce((s, w) => s + (w ?? 0), 0)
+  const portfolioShare = grandTotal > 0 ? portfolioValue / grandTotal : 1
   let ret = 0
-  for (const [cls, w] of Object.entries(weights) as [AssetClass, number | undefined][]) {
-    if (!w) continue
-    const normW = (w / holdingWeight) * portfolioShare
+  // Stable iteration also keeps random draws comparable across allocation changes.
+  for (const cls of Object.keys(ASSET_PARAMS) as AssetClass[]) {
+    const independent = randn(random)
+    const w = effectiveWeights[cls] ?? 0
     const p = ASSET_PARAMS[cls]
-    let r: number
-    switch (cls) {
-      case 'equity':
-      case 'blended':
-      case 'individual_stock':
-        r = histEquity + (p.mean - (SP500_REAL.reduce((s, x) => s + x, 0) / HIST_N)) // adjust for target mean
-        break
-      case 'bond':
-        r = histBond + (p.mean - (BOND10_REAL.reduce((s, x) => s + x, 0) / HIST_N))
-        break
-      case 'cash':
-        r = p.mean + inflationAdj  // cash return is nearly deterministic
-        break
-      case 'crypto':
-        r = p.mean + p.std * randn() + inflationAdj  // crypto independent
-        break
-      default: {
-        // For other classes: use equity z-score × their std + their mean
-        // This preserves the correlation with the equity market
-        const equityCorr = cls === 'tech_fund' ? 0.85
-          : cls === 'small_cap' ? 0.80
-          : cls === 'international' ? 0.65
-          : cls === 'intl_stock' ? 0.60
-          : cls === 'gold' ? 0.10
-          : cls === 'alternative' ? 0.30
-          : 0.70
-        // Decompose into correlated + independent components
-        const corrPart = equityCorr * zEquity * p.std
-        const indepPart = Math.sqrt(1 - equityCorr ** 2) * randn() * p.std
-        r = p.mean + inflationAdj + corrPart + indepPart
-        break
-      }
+    let z: number
+    if (cls === 'bond') z = zBond
+    else if (cls === 'cash') z = 0
+    else if (cls === 'crypto') z = independent
+    else {
+      const corr = cls === 'tech_fund' ? 0.85 : cls === 'small_cap' ? 0.8
+        : cls === 'international' ? 0.65 : cls === 'intl_stock' ? 0.6
+        : cls === 'gold' ? 0.1 : cls === 'alternative' ? 0.3 : 1
+      z = corr * zEquity + Math.sqrt(1 - corr ** 2) * independent
     }
-    ret += normW * r
+    ret += w / holdingWeight * portfolioShare * Math.max(-1, p.mean + inflationAdj + p.std * z)
   }
-
-  // Custom assets: parametric with equity correlation
   for (const asset of customAssets) {
-    if (asset.value <= 0) continue
-    const normW = asset.value / grandTotal
-    const corrPart = 0.40 * zEquity * asset.std
-    const indepPart = Math.sqrt(1 - 0.16) * randn() * asset.std
-    ret += normW * (asset.mean + inflationAdj + corrPart + indepPart)
+    const z = 0.4 * zEquity + Math.sqrt(1 - 0.16) * randn(random)
+    if (grandTotal > 0) ret += asset.value / grandTotal * Math.max(-1, asset.mean + inflationAdj + asset.std * z)
   }
-
   return ret
 }
 
-// Simple post-retirement blend (equity/bond mix) using bootstrap
-function bootstrapBlendReturn(
-  eqPct: number,
-  bdPct: number,
-  inflationAdj: number,
-): number {
-  const { equity: histEquity, bond: histBond } = drawHistoricalYear(inflationAdj)
-  const spHistMean = SP500_REAL.reduce((s, r) => s + r, 0) / HIST_N
-  const bondHistMean = BOND10_REAL.reduce((s, r) => s + r, 0) / HIST_N
-  // Adjust historical returns to match ASSET_PARAMS target means
-  const equityAdj = ASSET_PARAMS.equity.mean - spHistMean
-  const bondAdj = ASSET_PARAMS.bond.mean - bondHistMean
-  return eqPct * (histEquity + equityAdj) + bdPct * (histBond + bondAdj)
+function bootstrapBlendReturn(eqPct: number, bdPct: number, inflationAdj: number, random: Random): number {
+  const { zEquity, zBond } = drawHistoricalYear(random)
+  return eqPct * (ASSET_PARAMS.equity.mean + ASSET_PARAMS.equity.std * zEquity + inflationAdj)
+    + bdPct * (ASSET_PARAMS.bond.mean + ASSET_PARAMS.bond.std * zBond + inflationAdj)
 }
 
 function percentile(sorted: number[], p: number): number {
@@ -396,14 +330,15 @@ function computeRetirementThreshold(
   socialSecurity: SocialSecurity[],
   inflationRate: number,
   medianReturn: number,
+  effectiveTaxRate: number,
 ): number {
   let threshold = 0
   for (let age = retirementAge; age < maxAge; age++) {
     const ssIncome = getAnnualSSIncome(age, socialSecurity, inflationRate, currentAge)
-    const spend = Math.max(0, getAnnualSpend(age, spendingPhases, inflationRate, currentAge) - ssIncome)
-      + getLumpSumSpend(age, spendingPhases, inflationRate, currentAge)
+    const spend = Math.max(0, getAnnualSpend(age, spendingPhases, inflationRate, currentAge)
+      + getLumpSumSpend(age, spendingPhases, inflationRate, currentAge) - ssIncome)
     const discountYears = age - retirementAge
-    threshold += spend / Math.pow(1 + medianReturn, discountYears)
+    threshold += spend / (1 - effectiveTaxRate) / Math.pow(1 + medianReturn, discountYears)
   }
   return threshold
 }
@@ -455,14 +390,34 @@ export function runMonteCarlo(params: RetirementParams): MonteCarloResult {
   const {
     currentAge, retirementAge, maxAge,
     taxableBalance, retirementBalance,
-    monthlyContribution, holdingWeights, customAssets = [], socialSecurity = [], inflationRate,
+    monthlyContribution, holdingWeights, socialSecurity = [], inflationRate,
     effectiveTaxRate, spendingPhases, simCount,
     postRetirementEquityPct,
   } = params
+  if (![currentAge, retirementAge, maxAge, simCount].every(Number.isInteger) ||
+      currentAge < 0 || retirementAge < currentAge || maxAge <= retirementAge || maxAge > 150 || simCount <= 0 ||
+      ![taxableBalance, retirementBalance, monthlyContribution, inflationRate, effectiveTaxRate].every(Number.isFinite) ||
+      Math.min(taxableBalance, retirementBalance, monthlyContribution) < 0 || effectiveTaxRate < 0 || effectiveTaxRate >= 1 ||
+      (postRetirementEquityPct !== undefined && !(postRetirementEquityPct >= 0 && postRetirementEquityPct <= 1))) {
+    throw new RangeError('Invalid retirement simulation inputs')
+  }
+  const customAssets = (params.customAssets ?? []).filter(a => a.availableForSpending)
   // gross-up factor: spending $X requires withdrawing $X / (1 - taxRate) from portfolio
-  const taxGrossUp = effectiveTaxRate >= 1 ? 1 : 1 / (1 - effectiveTaxRate)
+  const taxGrossUp = 1 / (1 - effectiveTaxRate)
 
   const simulationPhases = spendingPhases.filter(p => !p.isPlanned)
+  const sortedPhases = [...simulationPhases].sort((a, b) => a.startAge - b.startAge)
+  if (customAssets.some(a => ![a.value, a.mean, a.std].every(Number.isFinite) || a.value < 0 || a.std < 0 || a.mean <= -1) ||
+      socialSecurity.some(s => !Number.isInteger(s.startAge) || !Number.isFinite(s.monthlyBenefit) || s.monthlyBenefit < 0) ||
+      Object.entries(holdingWeights).some(([cls, w]) => !(cls in ASSET_PARAMS) || !Number.isFinite(w) || (w ?? 0) < 0) ||
+      sortedPhases.some((p, i) => !Number.isInteger(p.startAge) || !Number.isInteger(p.endAge) || p.endAge <= p.startAge ||
+        (i > 0 && p.startAge < sortedPhases[i - 1].endAge) ||
+        !Number.isFinite(p.excessInflationRate ?? 0) || (p.excessInflationRate ?? 0) <= -1 ||
+        p.items.some(item => item.isLumpSum
+          ? !Number.isInteger(item.lumpSumAge) || !Number.isFinite(item.lumpSumAmount) || (item.lumpSumAmount ?? 0) < 0
+          : !Number.isFinite(item.monthlySpend) || item.monthlySpend < 0))) {
+    throw new RangeError('Invalid asset or spending assumptions')
+  }
 
   const totalYears = maxAge - currentAge
   const ages = Array.from({ length: totalYears + 1 }, (_, i) => currentAge + i)
@@ -487,12 +442,13 @@ export function runMonteCarlo(params: RetirementParams): MonteCarloResult {
 
   // Discount post-retirement spending at post-retirement mean for threshold
   const retirementThreshold = computeRetirementThreshold(
-    currentAge, retirementAge, maxAge, simulationPhases, socialSecurity, inflationRate, postMean,
+    currentAge, retirementAge, maxAge, simulationPhases, socialSecurity, inflationRate, postMean, effectiveTaxRate,
   )
 
   type SimRecord = {
     yearValues: number[]
     depleted: boolean
+    earlyWithdrawal: boolean
     finalValue: number
   }
 
@@ -504,73 +460,31 @@ export function runMonteCarlo(params: RetirementParams): MonteCarloResult {
     // yearValues[0] = initial balance; yearValues[i+1] = balance at end of year i
     const yearValues: number[] = [taxable + retirement]
     let depleted = false
+    let earlyWithdrawal = false
 
     for (let i = 0; i < totalYears; i++) {
       const age = currentAge + i  // age at START of this year
 
+      // Fixed-budget success means every planned payment can be funded; no
+      // undisclosed 20–40% spending cuts are applied on adverse paths.
+      const random = seededRandom((params.seed ?? 20261017) ^ Math.imul(s + 1, 0x9E3779B1) ^ Math.imul(age, 0x85EBCA6B))
       if (!depleted) {
-        // Lump sum payments apply regardless of retirement status
-        const lumpSum = getLumpSumSpend(age, simulationPhases, inflationRate, currentAge) * taxGrossUp
-        if (lumpSum > 0) {
-          const total = taxable + retirement
-          if (total >= lumpSum) {
-            const ratio = (total - lumpSum) / total
-            taxable *= ratio
-            retirement *= ratio
-          } else {
-            depleted = true
-            taxable = 0
-            retirement = 0
-          }
-        }
-      }
-
-      if (age >= retirementAge && !depleted) {
-        // SS income offsets spending before any portfolio withdrawal
-        const ssIncome = getAnnualSSIncome(age, socialSecurity, inflationRate, currentAge)
-        const baseSpend = Math.max(0, getAnnualSpend(age, simulationPhases, inflationRate, currentAge) - ssIncome)
-
-        // ── Dynamic guardrail spending strategy ──────────────────────────────
-        // If portfolio falls below a fraction of the "safe" threshold, reduce spending.
-        // Guardrail lower: portfolio < 80% of threshold → spend 80% of planned
-        // Guardrail floor: portfolio < 60% of threshold → spend 60% of planned
-        // This mimics real-world adaptive spending and significantly improves survival.
-        const portfolioNow = taxable + retirement
-        const guardedSpend = retirementThreshold <= 0 ? baseSpend
-          : portfolioNow < retirementThreshold * 0.60 ? baseSpend * 0.60
-          : portfolioNow < retirementThreshold * 0.80 ? baseSpend * 0.80
-          : baseSpend
-
-        // Start-of-year withdrawal: gross up by tax rate to get actual portfolio draw
-        const annualSpend = guardedSpend * taxGrossUp
-        if (annualSpend > 0) {
-          if (age < 60) {
-            // Pre-60: draw from taxable only
-            if (taxable >= annualSpend) {
-              taxable -= annualSpend
-            } else {
-              const remaining = annualSpend - taxable
-              taxable = 0
-              if (retirement >= remaining) {
-                retirement -= remaining
-              } else {
-                depleted = true
-                retirement = 0
-              }
-            }
-          } else {
-            // Post-60: pool taxable + retirement
-            const total = taxable + retirement
-            if (total >= annualSpend) {
-              const ratio = (total - annualSpend) / total
-              taxable *= ratio
-              retirement *= ratio
-            } else {
-              depleted = true
-              taxable = 0
-              retirement = 0
-            }
-          }
+        const ssIncome = age >= retirementAge ? getAnnualSSIncome(age, socialSecurity, inflationRate, currentAge) : 0
+        const recurring = age >= retirementAge ? getAnnualSpend(age, simulationPhases, inflationRate, currentAge) : 0
+        const withdrawal = Math.max(0, recurring + getLumpSumSpend(age, simulationPhases, inflationRate, currentAge) - ssIncome) * taxGrossUp
+        if (age < 60 && withdrawal > taxable && retirement > 0) earlyWithdrawal = true
+        if (withdrawal > taxable + retirement) {
+          depleted = true
+          taxable = 0
+          retirement = 0
+        } else if (age < 60) {
+          const fromTaxable = Math.min(taxable, withdrawal)
+          taxable -= fromTaxable
+          retirement -= withdrawal - fromTaxable
+        } else if (withdrawal > 0) {
+          const ratio = (taxable + retirement - withdrawal) / (taxable + retirement)
+          taxable *= ratio
+          retirement *= ratio
         }
       }
 
@@ -579,20 +493,20 @@ export function runMonteCarlo(params: RetirementParams): MonteCarloResult {
         let annualReturn: number
         if (age >= retirementAge) {
           // Post-retirement: equity/bond blend via bootstrap
-          annualReturn = bootstrapBlendReturn(eqPct, bdPct, inflationAdj)
+          annualReturn = bootstrapBlendReturn(eqPct, bdPct, inflationAdj, random)
         } else {
           // Pre-retirement: bootstrap per asset class with equity correlation
           annualReturn = bootstrapPortfolioReturn(
             holdingWeights, customAssets,
             taxableBalance + retirementBalance, customTotal,
-            inflationAdj,
+            inflationAdj, random,
           )
         }
         taxable = Math.max(0, taxable * (1 + annualReturn))
         retirement = Math.max(0, retirement * (1 + annualReturn))
       }
 
-      if (age < retirementAge) {
+      if (age < retirementAge && !depleted) {
         // End-of-year contribution during accumulation
         taxable += monthlyContribution * 12
       }
@@ -603,6 +517,7 @@ export function runMonteCarlo(params: RetirementParams): MonteCarloResult {
     sims.push({
       yearValues,
       depleted,
+      earlyWithdrawal,
       finalValue: yearValues[yearValues.length - 1],
     })
   }
@@ -636,6 +551,7 @@ export function runMonteCarlo(params: RetirementParams): MonteCarloResult {
   return {
     p10, p50, p90, ages,
     successRate,
+    earlyWithdrawalRate: sims.filter(s => s.earlyWithdrawal).length / simCount,
     medianGapToRetirement,
     yearsToRetirement,
   }
@@ -652,7 +568,7 @@ export function computePlanningRequired(
 ): number {
   const { currentAge, effectiveTaxRate } = params
   const excess = phase.excessInflationRate ?? 0
-  const taxGrossUp = effectiveTaxRate >= 1 ? 1 : 1 / (1 - effectiveTaxRate)
+  const taxGrossUp = 1 / (1 - effectiveTaxRate)
   let pv = 0
   for (let year = phase.startAge; year < phase.endAge; year++) {
     const yearsFromNow = year - currentAge
@@ -673,7 +589,7 @@ export function checkBridgeGap(
     taxableBalance, monthlyContribution,
     holdingWeights, inflationRate, effectiveTaxRate,
   } = params
-  const taxGrossUp = effectiveTaxRate >= 1 ? 1 : 1 / (1 - effectiveTaxRate)
+  const taxGrossUp = 1 / (1 - effectiveTaxRate)
   const { mean: blendedMeanBase } = computeBlendedParams(holdingWeights, taxableBalance + (params.retirementBalance ?? 0))
   const blendedMean = blendedMeanBase - (inflationRate - 0.025)
   const n = retirementAge - currentAge
@@ -685,14 +601,15 @@ export function checkBridgeGap(
     : monthlyContribution * 12 * (growth - 1) / blendedMean
   const taxableAtRetirement = taxableBalance * growth + contributions
 
-  // Sum nominal unplanned spending from retirementAge to 60 (clamped per phase)
+  // Rough bridge budget in the same real-dollar units as projected balances.
+  // No investment growth during this bridge is assumed.
   let pre60Cost = 0
-  for (const phase of unplannedPhases) {
-    const ageEnd = Math.min(phase.endAge, 60)
-    for (let year = phase.startAge; year < ageEnd; year++) {
-      const yearsFromNow = year - currentAge
-      pre60Cost += phaseMonthlyTotal(phase) * 12 * Math.pow(1 + inflationRate, yearsFromNow) * taxGrossUp
-    }
+  const phases = unplannedPhases.filter(p => !p.isPlanned)
+  for (let age = Math.max(currentAge, retirementAge); age < Math.min(60, params.maxAge); age++) {
+    const spending = getAnnualSpend(age, phases, inflationRate, currentAge)
+      + getLumpSumSpend(age, phases, inflationRate, currentAge)
+    const income = getAnnualSSIncome(age, params.socialSecurity ?? [], inflationRate, currentAge)
+    pre60Cost += Math.max(0, spending - income) * taxGrossUp
   }
 
   const shortfall = Math.max(0, pre60Cost - taxableAtRetirement)

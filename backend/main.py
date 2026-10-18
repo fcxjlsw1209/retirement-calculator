@@ -77,6 +77,9 @@ class HoldingOut(BaseModel):
     source: str
     account_name: Optional[str]
     account_type: Optional[str]
+    market_price: Optional[float] = None
+    market_value_usd: Optional[float] = None
+    market_date: Optional[date] = None
 
 
 class AssetClassSummary(BaseModel):
@@ -273,24 +276,13 @@ def get_portfolio():
     """Return merged holdings from all sources."""
     holdings = db.get_all_holdings()
     warnings = db.get_sync_warnings()
-
-    if not holdings:
-        return PortfolioResponse(
-            total_value_usd=0,
-            last_synced=None,
-            sources={},
-            holdings=[],
-            asset_class_summary={},
-            accounts=[],
-            warnings=warnings,
-        )
-
+    quotes = db.get_market_quotes()
     db_accounts = db.get_all_accounts()
     merged = list(holdings)
-    last_synced = max((h.synced_at for h in merged), default=None)
+    last_synced = max((h.synced_at for h in [*merged, *db_accounts]), default=None)
 
     visible_accounts = _get_visible_accounts(db_accounts)
-    total_value = sum(a.balance for a in visible_accounts) if visible_accounts else sum(h.value_usd for h in merged)
+    total_value = sum(a.balance for a in visible_accounts) if db_accounts else sum(h.value_usd for h in merged)
 
     # Asset class summary
     by_class: Dict[str, float] = {}
@@ -349,6 +341,10 @@ def get_portfolio():
                 source=h.source,
                 account_name=_display_account(h.account_name),
                 account_type=h.account_type,
+                market_price=quotes[h.ticker].price if h.ticker in quotes else None,
+                market_value_usd=(quotes[h.ticker].price * h.shares
+                                  if h.ticker in quotes and h.shares is not None and h.shares > 0 else None),
+                market_date=quotes[h.ticker].market_date if h.ticker in quotes else None,
             )
             for h in sorted(merged, key=lambda h: -h.value_usd)
         ],

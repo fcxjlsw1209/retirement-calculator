@@ -47,6 +47,7 @@ export interface RetirementData {
   holdingWeights: AssetClassWeights
   loading: boolean
   error: string | null
+  tagSaveError: boolean
   noSync: boolean  // true when no holdings have been synced yet
 }
 
@@ -55,6 +56,9 @@ export function useRetirementData(): RetirementData {
   const [tags, setTagsInternal] = useState<Record<string, boolean>>({})
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [tagSaveError, setTagSaveError] = useState(false)
+  const tagSaveQueue = useRef<Promise<unknown>>(Promise.resolve())
+  const tagRevision = useRef(0)
 
   useEffect(() => {
     Promise.all([api.portfolio.get(), api.retirement.accountTags.get()])
@@ -71,7 +75,11 @@ export function useRetirementData(): RetirementData {
 
   const setTags = useCallback((newTags: Record<string, boolean>) => {
     setTagsInternal(newTags)
-    api.retirement.accountTags.set(newTags).catch(() => {})
+    setTagSaveError(false)
+    const revision = ++tagRevision.current
+    const snapshot = { ...newTags }
+    tagSaveQueue.current = tagSaveQueue.current.then(() => api.retirement.accountTags.set(snapshot))
+      .catch(() => { if (revision === tagRevision.current) setTagSaveError(true) })
   }, [])
 
   const accounts = useMemo(() => portfolio?.accounts ?? [], [portfolio])
@@ -103,6 +111,7 @@ export function useRetirementData(): RetirementData {
     holdingWeights,
     loading,
     error,
+    tagSaveError,
     noSync,
   }
 }

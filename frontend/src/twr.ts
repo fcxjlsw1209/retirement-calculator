@@ -32,8 +32,10 @@ export function modifiedDietz(
   cashFlows: CashFlowEntry[],
   from: string,
   to: string
-): number {
+): number | null {
   const totalDays = daysBetween(from, to)
+  if (totalDays <= 0 || !Number.isFinite(totalDays)) return null
+  if (![vStart, vEnd, ...cashFlows.map(cf => cf.amount)].every(Number.isFinite)) return null
   let cfSum = 0
   let weightedCF = 0
   for (const cf of cashFlows) {
@@ -41,7 +43,10 @@ export function modifiedDietz(
     const weight = daysBetween(cf.date, to) / totalDays
     weightedCF += cf.amount * weight
   }
-  return (vEnd - vStart - cfSum) / (vStart + weightedCF)
+  const denominator = vStart + weightedCF
+  if (denominator <= 0) return null
+  const result = (vEnd - vStart - cfSum) / denominator
+  return Number.isFinite(result) ? result : null
 }
 
 /**
@@ -65,6 +70,7 @@ export function calcTWR(
 
   // Sort snapshots ASC
   const sorted = [...snapshots].sort((a, b) => a.date.localeCompare(b.date))
+  if (sorted.some((s, i) => i > 0 && s.date === sorted[i - 1].date)) return null
 
   // Sort cash flows ASC
   const sortedCFs = [...cashFlows].sort((a, b) => a.date.localeCompare(b.date))
@@ -100,13 +106,12 @@ export function calcTWR(
     }
     cfIndex = j
 
-    const r = periodCFs.length > 0
-      ? modifiedDietz(start.value, end.value, periodCFs, start.date, end.date)
-      : (end.value - start.value) / start.value
+    const r = modifiedDietz(start.value, end.value, periodCFs, start.date, end.date)
+    if (r === null || r < -1) return null
     product *= (1 + r)
   }
 
-  return product - 1
+  return Number.isFinite(product) ? product - 1 : null
 }
 
 /**
@@ -140,6 +145,9 @@ export function calcTWRFrom(
     const snapsBefore = sorted.filter(s => s.date < fromDate)
     if (snapsBefore.length > 0) {
       const lastBefore = snapsBefore[snapsBefore.length - 1]
+      // A stale balance or an unvalued deposit is not a valid period boundary.
+      if (daysBetween(lastBefore.date, fromDate) > MAX_EXACT_GAP_DAYS ||
+          cashFlows.some(cf => cf.date > lastBefore.date && cf.date < fromDate)) return null
       finalSnaps = [{ date: fromDate, value: lastBefore.value }, ...snapsAfter]
       insertedSyntheticStart = true
     } else {
@@ -160,51 +168,13 @@ export function calcTWRFrom(
  * Input: array of per-account snapshot arrays (each sorted ASC).
  * Rules:
  * - Same-date values are summed across accounts
- * - Missing dates for an account are forward-filled from the account's last known value
- * - Before an account's first snapshot, it contributes 0 (no backward-fill)
- * - Date range: union of all dates appearing in any account's snapshots, sorted ASC
+ * - Only dates valued for every selected account are eligible.
+ * - Never insert a new account as investment growth or combine stale valuations.
  */
 export function mergeDailySnapshots(accountSnapshots: DailySnapshot[][]): DailySnapshot[] {
-  if (accountSnapshots.length === 0) return []
-
-  // Sort each account's snapshots ASC
-  const accounts = accountSnapshots.map(acct =>
-    [...acct].sort((a, b) => a.date.localeCompare(b.date))
-  )
-
-  // Collect all dates across all accounts
-  const allDatesSet = new Set<string>()
-  for (const acct of accounts) {
-    for (const s of acct) {
-      allDatesSet.add(s.date)
-    }
-  }
-  const allDates = Array.from(allDatesSet).sort()
-
-  if (allDates.length === 0) return []
-
-  // For each date, sum across all accounts using forward-fill per account
-  const result: DailySnapshot[] = []
-
-  for (const date of allDates) {
-    let total = 0
-    for (const acct of accounts) {
-      // Find the most recent snapshot on or before this date
-      let lastKnown: number | null = null
-      for (const s of acct) {
-        if (s.date <= date) {
-          lastKnown = s.value
-        } else {
-          break
-        }
-      }
-      // Before account's first snapshot: contributes 0
-      if (lastKnown !== null) {
-        total += lastKnown
-      }
-    }
-    result.push({ date, value: total })
-  }
-
-  return result
+  if (accountSnapshots.length === 0 || accountSnapshots.some(a => a.length === 0)) return []
+  const accounts = accountSnapshots.map(snapshots => new Map(snapshots.map(s => [s.date, s.value])))
+  return [...accounts[0].keys()].sort()
+    .filter(date => accounts.every(account => account.has(date)))
+    .map(date => ({ date, value: accounts.reduce((sum, account) => sum + account.get(date)!, 0) }))
 }

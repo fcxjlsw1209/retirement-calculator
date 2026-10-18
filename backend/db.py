@@ -64,6 +64,28 @@ class Snapshot(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+class MarketQuote(SQLModel, table=True):
+    """Indicative prices kept separate from custodian balances and history."""
+    ticker: str = Field(primary_key=True)
+    price: float
+    market_date: date
+    fetched_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+def get_market_quotes() -> Dict[str, MarketQuote]:
+    with Session(engine()) as session:
+        return {q.ticker: q for q in session.exec(select(MarketQuote)).all()}
+
+
+def save_market_quotes(quotes: List[MarketQuote]) -> None:
+    with Session(engine()) as session:
+        for quote in quotes:
+            old = session.get(MarketQuote, quote.ticker)
+            if old is None or old.market_date <= quote.market_date:
+                session.merge(quote)
+        session.commit()
+
+
 class SyncLog(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     synced_at: datetime = Field(default_factory=datetime.utcnow)

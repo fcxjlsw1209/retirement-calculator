@@ -151,8 +151,7 @@ class TestAuth:
         assert r.status_code == 400
 
 
-        assert r.json()["holdings_imported"] == 1
-        assert r.json()["total_value_usd"] == pytest.approx(42_000)
+        assert "detail" in r.json()
 
 
 # ── /api/market-pulse ─────────────────────────────────────────────────────────

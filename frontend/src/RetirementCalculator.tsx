@@ -1,15 +1,17 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { ScenarioSaveQueue, type ScenarioPatch } from './scenarioSaveQueue'
 import { useRetirementData } from './RetirementAccountTagger'
 import RetirementAccountTagger from './RetirementAccountTagger'
 import SpendingTimeline from './SpendingTimeline'
 import RetirementChart, { OutputCards, YearlyTable } from './RetirementChart'
-import { runMonteCarlo, type SpendingPhase, type MonteCarloResult, type CustomAsset, type SocialSecurity } from './retirement'
+import { runMonteCarlo, fitSpendingPhases, ASSET_PARAMS, type SpendingPhase, type MonteCarloResult, type CustomAsset, type SocialSecurity } from './retirement'
 
 function migratePhase(p: SpendingPhase & { monthlySpend?: number }): SpendingPhase {
   const base = p.items ? p : {
     id: p.id, label: p.label, startAge: p.startAge, endAge: p.endAge,
     items: [{ id: `${p.id}-item`, label: '生活费', monthlySpend: p.monthlySpend ?? 0 }],
   }
+  // The current editor includes every phase in the displayed retirement budget.
   return { ...base, isPlanned: false }
 }
 import { api, type RetirementScenario } from './api'
@@ -157,7 +159,7 @@ function ScenarioBar({ scenarios, activeId, onSwitch, onCreate, onDuplicate, onD
           }}
         />
       ) : (
-        <select
+        <select aria-label="退休方案"
           value={activeId ?? ''}
           onChange={e => { setConfirmingDelete(false); onSwitch(Number(e.target.value)) }}
           style={{
@@ -217,7 +219,7 @@ function ScenarioBar({ scenarios, activeId, onSwitch, onCreate, onDuplicate, onD
 
 interface Props { hidden: boolean }
 
-export default function RetirementCalculator({ hidden: _hidden }: Props) {
+export default function RetirementCalculator({ hidden }: Props) {
   const data = useRetirementData()
 
   // ── Scenarios ─────────────────────────────────────────────────────────────
@@ -225,6 +227,7 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
   const [scenarios, setScenarios] = useState<RetirementScenario[]>([])
   const [activeId, setActiveId] = useState<number | null>(null)
   const [scenariosLoading, setScenariosLoading] = useState(true)
+  const [scenarioLoadError, setScenarioLoadError] = useState(false)
 
   // Load scenarios on mount; create default if none exist
   useEffect(() => {
@@ -247,7 +250,7 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
         setActiveId(list[0].id)  // list is sorted by updated_at desc
       }
       setScenariosLoading(false)
-    }).catch(() => setScenariosLoading(false))
+    }).catch(() => { setScenarioLoadError(true); setScenariosLoading(false) })
   }, [])
 
   // ── User inputs ──────────────────────────────────────────────────────────
@@ -266,12 +269,16 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
   const [socialSecurity, setSocialSecurity] = useState<SocialSecurity[]>([])
 
   // Load active scenario params into state when active scenario changes
-  const loadingScenarioRef = useRef(false)
+  const [loadedId, setLoadedId] = useState<number | null>(null)
+  const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'error'>('saved')
+  const [operationBusy, setOperationBusy] = useState(false)
+  const operationRef = useRef(false)
+  const saver = useRef(new ScenarioSaveQueue(api.retirement.scenarios.update))
+  const draftRef = useRef<{ id: number; patch: ScenarioPatch } | null>(null)
   useEffect(() => {
     if (activeId === null) return
     const s = scenarios.find(x => x.id === activeId)
     if (!s) return
-    loadingScenarioRef.current = true
     setCurrentAgeStr(s.current_age > 0 ? String(s.current_age) : '')
     setRetirementAge(s.retirement_age)
     setMaxAge(s.max_age)
@@ -283,19 +290,31 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
     setCustomAssets(payload.customAssets ?? [])
     setSocialSecurity(payload.socialSecurity ?? [])
     setInflationRate(payload.inflationRate ?? DEFAULT_INFLATION_RATE)
-    // Allow autosave to resume after state updates settle
-    setTimeout(() => { loadingScenarioRef.current = false }, 50)
+    saver.current.acknowledge(s.id, {
+      current_age: s.current_age,
+      retirement_age: s.retirement_age,
+      max_age: s.max_age,
+      monthly_contribution: s.monthly_contribution,
+      phases_json: serializePayload(payload.phases, payload.customAssets ?? [], payload.socialSecurity ?? [], payload.inflationRate ?? DEFAULT_INFLATION_RATE),
+      withdrawal_tax_rate: s.withdrawal_tax_rate ?? DEFAULT_TAX_RATE,
+      post_retirement_equity_pct: s.post_retirement_equity_pct ?? DEFAULT_POST_RETIREMENT_EQUITY,
+    })
+    prevRetirementAge.current = s.retirement_age
+    prevMaxAge.current = s.max_age
+    setLoadedId(s.id)
+    setSaveStatus('saved')
   }, [activeId]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const currentAge = parseInt(currentAgeStr, 10)
-  const currentAgeValid = !isNaN(currentAge) && currentAge >= 18 && currentAge < retirementAge
-  const retirementAgeValid = retirementAge > (currentAgeValid ? currentAge : 0) && retirementAge < maxAge
+  const currentAgeValid = !isNaN(currentAge) && currentAge >= 18 && currentAge <= retirementAge
+  const retirementAgeValid = retirementAge >= (currentAgeValid ? currentAge : 0) && retirementAge < maxAge
 
   // Keep phases clamped to retirementAge/maxAge when those change
   const prevRetirementAge = useRef(retirementAge)
   const prevMaxAge = useRef(maxAge)
 
   useEffect(() => {
+    if (loadedId !== activeId) return
     const retAgeChanged = retirementAge !== prevRetirementAge.current
     const maxAgeChanged = maxAge !== prevMaxAge.current
     prevRetirementAge.current = retirementAge
@@ -304,98 +323,111 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
     if (!retAgeChanged && !maxAgeChanged) return
 
     setPhases(prev => {
-      let updated = [...prev.map(p => ({ ...p }))]
-
-      updated[0] = { ...updated[0], startAge: retirementAge }
-      if (updated[0].endAge - updated[0].startAge < 2) {
-        updated[0] = { ...updated[0], endAge: updated[0].startAge + 2 }
-      }
-
-      const last = updated.length - 1
-      updated[last] = { ...updated[last], endAge: maxAge }
-      if (updated[last].endAge - updated[last].startAge < 2) {
-        updated[last] = { ...updated[last], startAge: updated[last].endAge - 2 }
-      }
-
-      return updated
+      if (prev.length === 0) return makeDefaultPhases(retirementAge, maxAge)
+      return fitSpendingPhases(prev, retirementAge, maxAge)
     })
-  }, [retirementAge, maxAge])
+  }, [retirementAge, maxAge, loadedId, activeId])
 
   // ── Auto-save ────────────────────────────────────────────────────────────
 
-  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const draft: ScenarioPatch = {
+    current_age: Number.isFinite(currentAge) ? currentAge : 0,
+    retirement_age: retirementAge,
+    max_age: maxAge,
+    monthly_contribution: monthlyContribution,
+    phases_json: serializePayload(phases, customAssets, socialSecurity, inflationRate),
+    withdrawal_tax_rate: withdrawalTaxRate,
+    post_retirement_equity_pct: postRetirementEquity,
+  }
+  draftRef.current = activeId !== null && loadedId === activeId ? { id: activeId, patch: draft } : null
+  const draftSignature = JSON.stringify(draftRef.current)
 
-  const saveScenario = useCallback(() => {
-    if (activeId === null || loadingScenarioRef.current) return
-    const patch = {
-      current_age: currentAgeValid ? currentAge : 0,
-      retirement_age: retirementAge,
-      max_age: maxAge,
-      monthly_contribution: monthlyContribution,
-      phases_json: serializePayload(phases, customAssets, socialSecurity, inflationRate),
-      withdrawal_tax_rate: withdrawalTaxRate,
-      post_retirement_equity_pct: postRetirementEquity,
+  const saveScenario = useCallback(async (): Promise<boolean> => {
+    const current = draftRef.current
+    if (!current || saver.current.isSaved(current.id, current.patch)) return true
+    setSaveStatus('saving')
+    try {
+      const updated = await saver.current.save(current.id, current.patch)
+      if (updated) setScenarios(prev => prev.map(s => s.id === updated.id ? updated : s))
+      const latest = draftRef.current
+      if (latest && saver.current.isSaved(latest.id, latest.patch)) setSaveStatus('saved')
+      return true
+    } catch {
+      setSaveStatus('error')
+      return false
     }
-    api.retirement.scenarios.update(activeId, patch)
-      .then(updated => {
-        setScenarios(prev => prev.map(s => s.id === updated.id ? updated : s))
-      })
-      .catch(() => {})
-  }, [activeId, currentAgeValid, currentAge, retirementAge, maxAge, monthlyContribution, phases, customAssets, socialSecurity, inflationRate, withdrawalTaxRate, postRetirementEquity])
-
-  useEffect(() => {
-    if (saveTimer.current) clearTimeout(saveTimer.current)
-    saveTimer.current = setTimeout(saveScenario, DEBOUNCE_MS)
-    return () => { if (saveTimer.current) clearTimeout(saveTimer.current) }
-  }, [saveScenario])
-
-  // ── Scenario operations ───────────────────────────────────────────────────
-
-  const handleSwitch = useCallback((id: number) => {
-    setActiveId(id)
   }, [])
 
-  const handleCreate = useCallback(async () => {
+  useEffect(() => {
+    const timer = setTimeout(() => { void saveScenario() }, DEBOUNCE_MS)
+    return () => clearTimeout(timer)
+  }, [draftSignature, saveScenario])
+
+  useEffect(() => () => {
+    const latest = draftRef.current
+    if (latest) void saver.current.save(latest.id, latest.patch).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    const warnUnsaved = (event: BeforeUnloadEvent) => {
+      const latest = draftRef.current
+      if (latest && !saver.current.isSaved(latest.id, latest.patch)) {
+        event.preventDefault()
+        event.returnValue = ''
+      }
+    }
+    window.addEventListener('beforeunload', warnUnsaved)
+    return () => window.removeEventListener('beforeunload', warnUnsaved)
+  }, [])
+
+  async function performOperation(operation: () => Promise<void>) {
+    if (operationRef.current) return
+    operationRef.current = true
+    setOperationBusy(true)
+    try {
+      do {
+        if (!await saveScenario()) return
+      } while (draftRef.current && !saver.current.isSaved(draftRef.current.id, draftRef.current.patch))
+      await operation()
+    } catch {
+      setSaveStatus('error')
+    } finally {
+      operationRef.current = false
+      setOperationBusy(false)
+    }
+  }
+
+  const handleSwitch = (id: number) => { void performOperation(async () => { setActiveId(id) }) }
+  const handleCreate = () => { void performOperation(async () => {
     const created = await api.retirement.scenarios.create({
       name: `方案 ${scenarios.length + 1}`,
-      current_age: 0,
-      retirement_age: DEFAULT_RETIREMENT_AGE,
-      max_age: DEFAULT_MAX_AGE,
+      current_age: 0, retirement_age: DEFAULT_RETIREMENT_AGE, max_age: DEFAULT_MAX_AGE,
       monthly_contribution: DEFAULT_MONTHLY_CONTRIBUTION,
       phases_json: JSON.stringify(makeDefaultPhases(DEFAULT_RETIREMENT_AGE, DEFAULT_MAX_AGE)),
-      withdrawal_tax_rate: DEFAULT_TAX_RATE,
+      withdrawal_tax_rate: DEFAULT_TAX_RATE, post_retirement_equity_pct: DEFAULT_POST_RETIREMENT_EQUITY,
     })
     setScenarios(prev => [created, ...prev])
     setActiveId(created.id)
-  }, [scenarios])
-
-  const handleDuplicate = useCallback(async () => {
+  }) }
+  const handleDuplicate = () => { void performOperation(async () => {
     const active = scenarios.find(s => s.id === activeId)
-    if (!active) return
-    const created = await api.retirement.scenarios.create({
-      name: `${active.name} 副本`,
-      current_age: active.current_age,
-      retirement_age: active.retirement_age,
-      max_age: active.max_age,
-      monthly_contribution: active.monthly_contribution,
-      phases_json: active.phases_json,  // already serialized payload
-      withdrawal_tax_rate: active.withdrawal_tax_rate,
-    })
+    const latest = draftRef.current
+    if (!active || !latest) return
+    const { id: _id, created_at: _created, updated_at: _updated, ...original } = active
+    const created = await api.retirement.scenarios.create({ ...original, ...latest.patch, name: `${active.name} 副本` })
     setScenarios(prev => [created, ...prev])
     setActiveId(created.id)
-  }, [scenarios, activeId])
-
-  const handleDelete = useCallback(async (id: number) => {
+  }) }
+  const handleDelete = (id: number) => { void performOperation(async () => {
     await api.retirement.scenarios.delete(id)
     const remaining = scenarios.filter(s => s.id !== id)
     setScenarios(remaining)
-    if (remaining.length > 0) setActiveId(remaining[0].id)
-  }, [scenarios])
-
-  const handleRename = useCallback(async (id: number, name: string) => {
-    const updated = await api.retirement.scenarios.update(id, { name }).catch(() => null)
-    if (updated) setScenarios(prev => prev.map(s => s.id === updated.id ? updated : s))
-  }, [])
+    setActiveId(remaining[0]?.id ?? null)
+  }) }
+  const handleRename = (id: number, name: string) => { void performOperation(async () => {
+    const updated = await api.retirement.scenarios.update(id, { name })
+    setScenarios(prev => prev.map(s => s.id === updated.id ? updated : s))
+  }) }
 
   // ── Monte Carlo ───────────────────────────────────────────────────────────
 
@@ -403,25 +435,27 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const runSim = useCallback(() => {
-    if (!currentAgeValid || !retirementAgeValid || data.loading) return
+    if (!currentAgeValid || !retirementAgeValid || data.loading || monthlyContribution < 0) { setMcResult(null); return }
 
-    const result = runMonteCarlo({
-      currentAge,
-      retirementAge,
-      maxAge,
-      taxableBalance: data.taxableTotal,
-      retirementBalance: data.retirementTotal,
-      monthlyContribution,
-      holdingWeights: data.holdingWeights,
-      customAssets,
-      socialSecurity,
-      inflationRate,
-      effectiveTaxRate: withdrawalTaxRate,
-      spendingPhases: phases,
-      simCount: SIM_COUNT,
-      postRetirementEquityPct: postRetirementEquity,
-    })
-    setMcResult(result)
+    try {
+      const result = runMonteCarlo({
+        currentAge,
+        retirementAge,
+        maxAge,
+        taxableBalance: data.taxableTotal,
+        retirementBalance: data.retirementTotal,
+        monthlyContribution,
+        holdingWeights: data.holdingWeights,
+        customAssets,
+        socialSecurity,
+        inflationRate,
+        effectiveTaxRate: withdrawalTaxRate,
+        spendingPhases: phases,
+        simCount: SIM_COUNT,
+        postRetirementEquityPct: postRetirementEquity,
+      })
+      setMcResult(result)
+    } catch { setMcResult(null) }
   }, [
     currentAgeValid, retirementAgeValid, data.loading,
     currentAge, retirementAge, maxAge,
@@ -430,6 +464,7 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
   ])
 
   useEffect(() => {
+    setMcResult(null)
     if (debounceTimer.current) clearTimeout(debounceTimer.current)
     debounceTimer.current = setTimeout(runSim, DEBOUNCE_MS)
     return () => { if (debounceTimer.current) clearTimeout(debounceTimer.current) }
@@ -445,21 +480,23 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
     )
   }
 
-  if (data.error) {
+  if (data.error || scenarioLoadError) {
     return (
       <div style={{
         background: 'rgba(192,107,90,0.1)', border: '1px solid #C06B5A',
         borderRadius: 6, padding: '12px 16px', color: '#C06B5A', fontSize: 13,
       }}>
-        加载失败：{data.error}
+        加载失败：{data.error ?? '未能读取退休方案，请刷新页面重试。'}
       </div>
     )
   }
 
+  if (hidden) return <p style={{ color: '#6B6460', padding: '24px 0' }}>金额已隐藏。点击顶部金额开关后查看或编辑退休方案。</p>
+
   // ── Render ────────────────────────────────────────────────────────────────
 
   return (
-    <div style={{ paddingBottom: 64 }}>
+    <fieldset disabled={operationBusy} style={{ padding: 0, paddingBottom: 64, border: 0, margin: 0, minWidth: 0 }}>
       {/* Page title */}
       <div style={{ marginBottom: 24 }}>
         <h2 style={{
@@ -493,6 +530,25 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
         onRename={handleRename}
       />
 
+      <div role="status" style={{ fontSize: 12, color: saveStatus === 'error' ? '#C06B5A' : '#6B6460', marginBottom: 16 }}>
+        {saveStatus === 'saving' ? '保存中…' : saveStatus === 'error' ? '保存或操作失败，当前修改仍保留在页面中。' : draftRef.current && !saver.current.isSaved(draftRef.current.id, draftRef.current.patch) ? '尚未保存…' : '已保存'}
+        {saveStatus === 'error' && <button onClick={() => { void saveScenario() }} style={stepBtnStyle}>重试保存</button>}
+      </div>
+      {mcResult && <OutputCards result={mcResult} retirementAge={retirementAge} />}
+      <p style={{ fontSize: 12, color: '#6B6460', lineHeight: 1.7 }}>
+        成功率按完整支出预算计算，不自动削减开支；金额均为今日购买力。相同参数使用相同的 1,000 条随机路径。
+        资金缺口是按平均回报折现的参考值，不是安全退休门槛。
+      </p>
+      <details style={{ fontSize: 12, color: '#6B6460', marginBottom: 16, lineHeight: 1.7 }}>
+        <summary style={{ cursor: 'pointer' }}>计算假设与数据来源</summary>
+        <p>按年模拟，年初支出、年末投入。股债冲击按同一历史年份抽样，再缩放至假设的均值与波动率；不代表预测收益。</p>
+        <p>退休后权益假设：实际年均 {ASSET_PARAMS.equity.mean * 100}%，波动率 {ASSET_PARAMS.equity.std * 100}%；债券：实际年均 {ASSET_PARAMS.bond.mean * 100}%，波动率 {ASSET_PARAMS.bond.std * 100}%。通胀基准为 2.5%。</p>
+        <p>社保金额按今日购买力，先抵扣支出；净支出再按综合税率折算。尚未逐项模拟 Roth、RMD、提前提款例外和房产出售税费。</p>
+        <a href="https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/histretSP.html" target="_blank" rel="noreferrer" style={{ color: '#C8A96E' }}>NYU 历史收益数据（1928–2025，已逐年扣除通胀）</a>
+      </details>
+      {mcResult && mcResult.earlyWithdrawalRate > 0 && <p style={{ color: '#C06B5A', fontSize: 12 }}>
+        {Math.round(mcResult.earlyWithdrawalRate * 100)}% 的路径需要在 60 岁前动用退休账户。成功率尚未扣除提前提款税费，也未验证提款资格，需另行安排过渡资金。
+      </p>}
       {/* No-sync banner */}
       {data.noSync && (
         <div style={{
@@ -508,13 +564,16 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
 
       {/* ── Section: 当前资产 ── */}
       <Section title="当前资产（来自最新同步）">
+        {data.tagSaveError && <p role="alert" style={{ color: '#C06B5A', fontSize: 12 }}>
+          账户标记未保存。<button onClick={() => data.setTags(data.tags)} style={stepBtnStyle}>重试</button>
+        </p>}
         <RetirementAccountTagger
           accounts={data.accounts}
           tags={data.tags}
           onTagsChange={data.setTags}
           taxableTotal={data.taxableTotal}
           retirementTotal={data.retirementTotal}
-          hidden={false}
+          hidden={hidden}
         />
       </Section>
 
@@ -532,7 +591,7 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
       <Section title="基本参数">
         <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', alignItems: 'flex-start' }}>
           <Field label="当前年龄">
-            <input
+            <input aria-label="当前年龄"
               style={inputStyle(!currentAgeValid && currentAgeStr !== '')}
               type="number"
               min="18"
@@ -542,20 +601,20 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
               placeholder="—"
             />
             {!currentAgeValid && currentAgeStr !== '' && (
-              <div style={{ fontSize: 10, color: '#C06B5A', marginTop: 2 }}>18–{retirementAge - 1}</div>
+              <div style={{ fontSize: 10, color: '#C06B5A', marginTop: 2 }}>18–{retirementAge}</div>
             )}
           </Field>
 
           <Field label="退休年龄">
             <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
               <button
-                onClick={() => setRetirementAge(a => Math.max((currentAgeValid ? currentAge + 1 : 20), a - 1))}
+                onClick={() => setRetirementAge(a => Math.max((currentAgeValid ? currentAge : 20), a - 1))}
                 style={{ ...stepBtnStyle, borderRadius: '4px 0 0 4px' }}
               >−</button>
-              <input
+              <input aria-label="退休年龄"
                 style={{ ...inputStyle(!retirementAgeValid), borderRadius: 0, borderLeft: 'none', borderRight: 'none', width: 52, textAlign: 'center' }}
                 type="number"
-                min={currentAgeValid ? currentAge + 1 : 20}
+                min={currentAgeValid ? currentAge : 20}
                 max={maxAge - 1}
                 value={retirementAge}
                 onChange={e => setRetirementAge(parseInt(e.target.value, 10) || DEFAULT_RETIREMENT_AGE)}
@@ -565,10 +624,11 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
                 style={{ ...stepBtnStyle, borderRadius: '0 4px 4px 0' }}
               >+</button>
             </div>
+            <div style={{ fontSize: 10, color: '#6B6460', marginTop: 2 }}>设为当前年龄，可测算现在退休</div>
           </Field>
 
           <Field label="预期寿命">
-            <input
+            <input aria-label="预期寿命"
               style={inputStyle()}
               type="number"
               min={retirementAge + 1}
@@ -581,7 +641,7 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
           <Field label="退休前月投入">
             <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
               <span style={{ color: '#6B6460', fontSize: 13, fontFamily: "'JetBrains Mono', monospace" }}>$</span>
-              <input
+              <input aria-label="退休前月投入"
                 style={{ ...inputStyle(), width: 96 }}
                 type="number"
                 min="0"
@@ -594,7 +654,7 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
 
           <Field label="通胀率假设">
             <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-              <input
+              <input aria-label="通胀率假设"
                 style={{ ...inputStyle(), width: 64 }}
                 type="number"
                 min="0"
@@ -613,7 +673,7 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
 
           <Field label="综合提取税率">
             <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-              <input
+              <input aria-label="综合提取税率"
                 style={{ ...inputStyle(), width: 64 }}
                 type="number"
                 min="0"
@@ -627,12 +687,12 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
               />
               <span style={{ color: '#6B6460', fontSize: 13, fontFamily: "'JetBrains Mono', monospace" }}>%</span>
             </div>
-            <div style={{ fontSize: 10, color: '#3A3530', marginTop: 2 }}>含联邦+州所得税</div>
+            <div style={{ fontSize: 10, color: '#6B6460', marginTop: 2 }}>统一税率估算，尚未区分账户税务</div>
           </Field>
 
           <Field label="退休后权益比例">
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <input
+              <input aria-label="退休后权益比例"
                 type="range"
                 min={0}
                 max={100}
@@ -646,7 +706,7 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
               </span>
             </div>
             <div style={{ fontSize: 10, color: '#3A3530', marginTop: 2 }}>
-              余下为债券/现金 · 影响退休后模拟回报率
+              余下为债券 · 影响退休后模拟回报率
             </div>
           </Field>
         </div>
@@ -677,12 +737,11 @@ export default function RetirementCalculator({ hidden: _hidden }: Props) {
         ) : mcResult ? (
           <>
             <RetirementChart result={mcResult} retirementAge={retirementAge} />
-            <OutputCards result={mcResult} monthlyContribution={monthlyContribution} />
             <YearlyTable result={mcResult} retirementAge={retirementAge} />
           </>
-        ) : null}
+        ) : <p style={{ color: '#6B6460', fontSize: 12 }}>计算中，或参数无效；请检查年龄、阶段重叠和非负金额。</p>}
       </Section>
-    </div>
+    </fieldset>
   )
 }
 
@@ -728,9 +787,9 @@ function CustomAssetEditor({ assets, onChange }: { assets: CustomAsset[]; onChan
   return (
     <div>
       {assets.length > 0 && (
-        <div style={{ marginBottom: 8 }}>
+        <div style={{ marginBottom: 8, overflowX: 'auto' }}>
           {/* Header */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 110px 80px 80px 28px', gap: 6, marginBottom: 4, paddingLeft: 2 }}>
+          <div style={{ display: 'grid', minWidth: 440, gridTemplateColumns: '1fr 110px 80px 80px 28px', gap: 6, marginBottom: 4, paddingLeft: 2 }}>
             <span style={capStyle}>名称</span>
             <span style={{ ...capStyle, textAlign: 'right' }}>当前市值</span>
             <span style={{ ...capStyle, textAlign: 'right' }}>年化收益</span>
@@ -738,7 +797,7 @@ function CustomAssetEditor({ assets, onChange }: { assets: CustomAsset[]; onChan
             <span />
           </div>
           {assets.map(asset => (
-            <div key={asset.id} style={{ display: 'grid', gridTemplateColumns: '1fr 110px 80px 80px 28px', gap: 6, marginBottom: 6, alignItems: 'center' }}>
+            <div key={asset.id}><div style={{ display: 'grid', minWidth: 440, gridTemplateColumns: '1fr 110px 80px 80px 28px', gap: 6, marginBottom: 6, alignItems: 'center' }}>
               <input
                 style={{ ...cellStyle, width: '100%', boxSizing: 'border-box' }}
                 value={asset.name}
@@ -775,10 +834,14 @@ function CustomAssetEditor({ assets, onChange }: { assets: CustomAsset[]; onChan
                 style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#6B6460', fontSize: 16, padding: 0, lineHeight: 1 }}
               >×</button>
             </div>
+            <label style={{ fontSize: 11, color: '#6B6460', display: 'block', marginBottom: 12 }}>
+              <input type="checkbox" checked={asset.availableForSpending ?? false} onChange={e => update(asset.id, { availableForSpending: e.target.checked })} />
+              按可变现净额纳入；假设退休时无额外费用转入上述股债组合
+            </label></div>
           ))}
           {assets.length > 0 && (
             <div style={{ fontSize: 11, color: '#6B6460', fontFamily: "'JetBrains Mono', monospace", marginTop: 2 }}>
-              合计 {fmt(totalValue)} · 已纳入模拟（归入常规账户）
+              记录市值 {fmt(totalValue)} · 仅勾选的可变现资产纳入模拟
             </div>
           )}
         </div>
@@ -795,7 +858,7 @@ function CustomAssetEditor({ assets, onChange }: { assets: CustomAsset[]; onChan
       </button>
       {assets.length === 0 && (
         <span style={{ marginLeft: 10, fontSize: 11, color: '#3A3530', fontFamily: "'Space Grotesk', sans-serif" }}>
-          如投资房、私募、股权等非上市资产
+          如房产、私募等；未勾选的资产不用于支付退休开支
         </span>
       )}
     </div>

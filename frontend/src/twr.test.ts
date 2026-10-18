@@ -104,7 +104,7 @@ describe('calcTWR', () => {
     ]
     const twr = calcTWR(snapshots, cashFlows)
     expect(twr).not.toBeNull()
-    expect(twr!).toBeCloseTo(modifiedDietz(100000, 113000, cashFlows, '2026-05-01', '2026-05-31'), 10)
+    expect(twr!).toBeCloseTo(modifiedDietz(100000, 113000, cashFlows, '2026-05-01', '2026-05-31')!, 10)
   })
 
   // Test 5: Two CFs (three sub-periods)
@@ -150,7 +150,7 @@ describe('mergeDailySnapshots', () => {
   })
 
   // Test 7: Account B starts later (gap at beginning)
-  it('contributes 0 for account B before its first snapshot', () => {
+  it('starts only when both accounts have a valuation', () => {
     const accountA = [
       { date: '2026-01-01', value: 100 },
       { date: '2026-01-02', value: 110 },
@@ -162,14 +162,13 @@ describe('mergeDailySnapshots', () => {
     ]
     const result = mergeDailySnapshots([accountA, accountB])
     expect(result).toEqual([
-      { date: '2026-01-01', value: 100 },   // B contributes 0
       { date: '2026-01-02', value: 310 },
       { date: '2026-01-03', value: 325 },
     ])
   })
 
   // Test 8: Forward-fill (account A missing Jan 2)
-  it('forward-fills missing dates within an account', () => {
+  it('omits dates with an unvalued account', () => {
     const accountA = [
       { date: '2026-01-01', value: 100 },
       { date: '2026-01-03', value: 120 },  // Jan 2 missing
@@ -182,7 +181,6 @@ describe('mergeDailySnapshots', () => {
     const result = mergeDailySnapshots([accountA, accountB])
     expect(result).toEqual([
       { date: '2026-01-01', value: 300 },
-      { date: '2026-01-02', value: 310 },  // A forward-filled as 100
       { date: '2026-01-03', value: 340 },
     ])
   })
@@ -260,24 +258,8 @@ describe('calcTWRFrom', () => {
     expect(result!).toBeCloseTo(expected, 6)
   })
 
-  // T3: fromDate between two snapshots — forward-fills the snapshot from the latest one before fromDate
-  it('forward-fills snapshot from before fromDate when fromDate falls between snapshots', () => {
-    // from 2026-02-01: we have a snapshot on 2026-01-01 (100000).
-    // So we forward-fill 2026-02-01 with value 100000, and include snapshots on 4/1 (103000) and 6/1 (106000).
-    // CFs are filtered to >= 2026-02-01, meaning we keep CF on 3/1 (5000) and 5/1 (2000).
-    const result = calcTWRFrom(snapshots, cashFlows, '2026-02-01')
-    expect(result).not.toBeNull()
-
-    // 1st sub-period: 2/1 (100k) to 4/1 (103k) with CF 3/1 (5k)
-    // totalDays = 59, CF days to 4/1 = 31, weight = 31/59
-    // wCF = 5000 * 31 / 59 ≈ 2627.1186
-    // r1 = (103000 - 100000 - 5000) / (100000 + wCF) = -2000 / 102627.1186 ≈ -0.01948802
-    // 2nd sub-period: 4/1 (103k) to 6/1 (106k) with CF 5/1 (2k)
-    // totalDays = 61, CF days to 6/1 = 31, weight = 31/61
-    // wCF = 2000 * 31 / 61 ≈ 1016.39344
-    // r2 = (106000 - 103000 - 2000) / (103000 + wCF) = 1000 / 104016.39344 ≈ 0.009613868
-    // TWR = (1 + r1) * (1 + r2) - 1 ≈ -0.0100615
-    expect(result!).toBeCloseTo(-0.0100615, 6)
+  it('does not manufacture a month-old period-start valuation', () => {
+    expect(calcTWRFrom(snapshots, cashFlows, '2026-02-01')).toBeNull()
   })
 
   it('includes cash flow on synthetic fromDate start', () => {
@@ -310,4 +292,33 @@ describe('calcTWRFrom', () => {
     )
     expect(withEarlyCF).toBeCloseTo(withoutEarlyCF!, 10)
   })
+})
+
+
+describe('incomplete and zero-balance history', () => {
+  it('does not report an unfunded account as an infinite return', () => {
+    expect(calcTWR([{ date: '2026-01-01', value: 0 }, { date: '2026-01-02', value: 100 }], [])).toBeNull()
+    expect(modifiedDietz(100, 0, [{ date: '2026-01-01', amount: -100 }], '2026-01-01', '2026-01-02')).toBeNull()
+  })
+  it('does not count a deposit before a synthetic period start as growth', () => {
+    const snapshots = [{ date: '2026-01-01', value: 100 }, { date: '2026-01-10', value: 200 }]
+    expect(calcTWRFrom(snapshots, [{ date: '2026-01-02', amount: 100 }], '2026-01-03')).toBeNull()
+  })
+  it('returns no aggregate when a selected account has no history', () => {
+    expect(mergeDailySnapshots([[{ date: '2026-01-01', value: 100 }], []])).toEqual([])
+  })
+  it('does not turn a newly included account into a 100% gain', () => {
+    const merged = mergeDailySnapshots([
+      [{ date: '2026-01-01', value: 100 }, { date: '2026-01-02', value: 100 }, { date: '2026-01-03', value: 100 }],
+      [{ date: '2026-01-02', value: 100 }, { date: '2026-01-03', value: 100 }],
+    ])
+    expect(calcTWR(merged, [])).toBe(0)
+  })
+  it('rejects non-finite valuations', () => {
+    expect(modifiedDietz(100, Infinity, [], '2026-01-01', '2026-01-02')).toBeNull()
+  })
+})
+
+it('does not report a return from ambiguous duplicate-date valuations', () => {
+  expect(calcTWR([{ date: '2026-01-01', value: 100 }, { date: '2026-01-01', value: 101 }], [])).toBeNull()
 })

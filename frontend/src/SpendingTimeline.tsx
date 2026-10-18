@@ -4,7 +4,7 @@ import { phaseMonthlyTotal, phaseLumpSums } from './retirement'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const PHASE_COLORS = ['#3A3530', '#4A3828', '#2E3A30', '#3A2E3A']
+const PHASE_COLORS = ['#3A3530', '#4A3828', '#44382F', '#514334']
 const TIMELINE_HEIGHT = 68
 const MIN_PHASE_YEARS = 2
 
@@ -52,7 +52,7 @@ export default function SpendingTimeline({ phases, currentAge, maxAge, onChange 
 
   // ── Drag ──────────────────────────────────────────────────────────────────
 
-  const startDrag = useCallback((e: React.MouseEvent, handleIndex: number) => {
+  const startDrag = useCallback((e: React.PointerEvent, handleIndex: number) => {
     e.preventDefault()
     e.stopPropagation()
     dragRef.current = {
@@ -64,7 +64,7 @@ export default function SpendingTimeline({ phases, currentAge, maxAge, onChange 
   }, [phases])
 
   useEffect(() => {
-    const onMove = (e: MouseEvent) => {
+    const onMove = (e: PointerEvent) => {
       const drag = dragRef.current
       if (!drag || !containerRef.current) return
 
@@ -91,11 +91,13 @@ export default function SpendingTimeline({ phases, currentAge, maxAge, onChange 
 
     const onUp = () => { dragRef.current = null }
 
-    document.addEventListener('mousemove', onMove)
-    document.addEventListener('mouseup', onUp)
+    document.addEventListener('pointermove', onMove)
+    document.addEventListener('pointerup', onUp)
+    document.addEventListener('pointercancel', onUp)
     return () => {
-      document.removeEventListener('mousemove', onMove)
-      document.removeEventListener('mouseup', onUp)
+      document.removeEventListener('pointermove', onMove)
+      document.removeEventListener('pointerup', onUp)
+      document.removeEventListener('pointercancel', onUp)
     }
   }, [totalSpan, onChange])
 
@@ -266,6 +268,19 @@ export default function SpendingTimeline({ phases, currentAge, maxAge, onChange 
         totalSpan={totalSpan}
       />
 
+      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 8 }}>
+        {phases.slice(0, -1).map((phase, i) => <label key={phase.id} style={{ color: '#6B6460', fontSize: 11 }}>
+          {phase.label}结束年龄{' '}
+          <input type="number" value={phase.endAge} min={phase.startAge + 1} max={phases[i + 1].endAge - 1}
+            onChange={event => {
+              const age = Number(event.target.value)
+              if (!Number.isInteger(age) || age <= phase.startAge || age >= phases[i + 1].endAge) return
+              onChange(phases.map((p, index) => index === i ? { ...p, endAge: age } : index === i + 1 ? { ...p, startAge: age } : p))
+            }}
+            style={{ width: 54, background: '#0E0E0E', border: '1px solid #2A2826', borderRadius: 4, color: '#E8E0D0', padding: 4, fontFamily: "'JetBrains Mono', monospace" }} />
+        </label>)}
+      </div>
+
       {/* Controls */}
       <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 10 }}>
         <button
@@ -319,7 +334,7 @@ interface PhaseBlockProps {
   isFirst: boolean
   isLast: boolean
   showDragHandle: boolean
-  onDragHandleDown: (e: React.MouseEvent) => void
+  onDragHandleDown: (e: React.PointerEvent) => void
   onClick: (e: React.MouseEvent) => void
 }
 
@@ -388,7 +403,7 @@ function PhaseBlock({
 
       {/* Drag handle (right edge, except last phase) */}
       {showDragHandle && (
-        <DragHandle onMouseDown={onDragHandleDown} />
+        <DragHandle onPointerDown={onDragHandleDown} />
       )}
     </div>
   )
@@ -396,12 +411,12 @@ function PhaseBlock({
 
 // ─── DragHandle ───────────────────────────────────────────────────────────────
 
-function DragHandle({ onMouseDown }: { onMouseDown: (e: React.MouseEvent) => void }) {
+function DragHandle({ onPointerDown }: { onPointerDown: (e: React.PointerEvent) => void }) {
   const [hovered, setHovered] = useState(false)
 
   return (
     <div
-      onMouseDown={onMouseDown}
+      onPointerDown={onPointerDown}
       onClick={e => e.stopPropagation()}  // prevent opening edit on the left phase
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
@@ -412,6 +427,7 @@ function DragHandle({ onMouseDown }: { onMouseDown: (e: React.MouseEvent) => voi
         width: 12,
         height: '100%',
         cursor: 'col-resize',
+        touchAction: 'none',
         zIndex: 10,
         display: 'flex',
         alignItems: 'center',

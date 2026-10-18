@@ -68,7 +68,7 @@ function groupByFirm(accounts: { account_name: string; firm_name?: string | null
   return Array.from(map.values())
 }
 
-export default function PerformanceChart() {
+export default function PerformanceChart({ hidden, revision }: { hidden: boolean; revision?: string | null }) {
   const [timeRange, setTimeRange] = useState<TimeRange>('all')
   const [historyData, setHistoryData] = useState<PortfolioHistory | null>(null)
   const [loading, setLoading] = useState(true)
@@ -78,19 +78,28 @@ export default function PerformanceChart() {
   const popoverRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    setLoading(true)
-    api.portfolio.history()
-      .then(data => {
-        setHistoryData(data)
-        setSelectedAccounts(prev =>
-          prev.size === 0
-            ? new Set(data.accounts.map(a => a.account_name))
-            : prev
-        )
-      })
-      .catch(() => setHistoryData(null))
-      .finally(() => setLoading(false))
-  }, [])
+    let cancelled = false
+    let requestId = 0
+    const load = () => {
+      const currentRequest = ++requestId
+      setLoading(true)
+      api.portfolio.history()
+        .then(data => {
+          if (cancelled || currentRequest !== requestId) return
+          setHistoryData(data)
+          setSelectedAccounts(prev =>
+            prev.size === 0
+              ? new Set(data.accounts.map(a => a.account_name))
+              : prev
+          )
+        })
+        .catch(() => { if (!cancelled && currentRequest === requestId) setHistoryData(null) })
+        .finally(() => { if (!cancelled && currentRequest === requestId) setLoading(false) })
+    }
+    load()
+    window.addEventListener('portfolio-history-changed', load)
+    return () => { cancelled = true; window.removeEventListener('portfolio-history-changed', load) }
+  }, [revision])
 
   // Close popover on outside click
   useEffect(() => {
@@ -208,8 +217,13 @@ export default function PerformanceChart() {
     fontSize: 8, fontWeight: 700, color: '#0E0E0E',
   })
 
+  if (hidden) return <p style={{ color: '#6B6460', fontSize: 12 }}>金额已隐藏，资产历史图与现金流已收起。</p>
+
   return (
     <div style={{ marginBottom: 24 }}>
+      <p style={{ color: '#6B6460', fontSize: 12, lineHeight: 1.6 }}>
+        估算时间加权收益：按共同快照日期计算，现金流区间使用 Modified Dietz；缺少可靠期初估值时显示 —。下图为资产余额，包含出入金。
+      </p>
       {/* Performance number row */}
       <div style={{ display: 'flex', gap: 28, marginBottom: 16, alignItems: 'baseline', flexWrap: 'wrap' }}>
         <PerfNum label={sinceDate ? `Since ${fmtShortDate(sinceDate)}` : 'Since Start'} value={twr} />

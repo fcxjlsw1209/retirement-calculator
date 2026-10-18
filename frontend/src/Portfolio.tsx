@@ -10,20 +10,8 @@ const SOURCE_LABEL: Record<string, string> = {
   empower: 'Empower',
 }
 
-// Categorical palette for allocation bars: cross-hue, muted, dark-mode legible
-const ALLOCATION_PALETTE = [
-  '#C8A96E',  // antique gold
-  '#7EB87A',  // sage green
-  '#C87860',  // burnt sienna
-  '#7898B0',  // steel blue
-  '#C0B048',  // warm ochre
-  '#90A888',  // muted sage
-  '#C89878',  // copper peach
-  '#8878B0',  // soft violet
-  '#78A8A0',  // teal
-  '#B07880',  // dusty rose
-  '#4A4840',  // 其他 — dark neutral
-]
+// Warm categorical shades follow DESIGN.md; labels remain the primary key.
+const ALLOCATION_PALETTE = ['#C8A96E', '#C06B5A', '#A68D68', '#8C7565', '#D0B995', '#9A9490', '#6B6460', '#4A4840']
 const OTHER_COLOR = '#4A4840'
 
 const MASK = '●●●●●'
@@ -109,14 +97,15 @@ function HoldingsTable({ holdings, showAccount, firmMap, portfolioTotal, hidden 
   hidden: boolean
 }) {
   return (
-    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+    <div style={{ overflowX: 'auto' }}><table style={{ width: '100%', minWidth: 600, borderCollapse: 'collapse', fontSize: 12 }}>
       <thead>
         <tr style={{ background: '#0E0E0E' }}>
           <th style={thStyle('left')}>名称</th>
           {showAccount && <th style={thStyle('left')}>账户</th>}
           <th style={thStyle('right')}>股数</th>
-          <th style={thStyle('right')}>单价</th>
-          <th style={thStyle('right')}>市值</th>
+          <th style={thStyle('right')}>同步单价</th>
+          <th style={thStyle('right')}>同步市值</th>
+          <th style={thStyle('right')}>行情估值</th>
         </tr>
       </thead>
       <tbody>
@@ -145,10 +134,10 @@ function HoldingsTable({ holdings, showAccount, firmMap, portfolioTotal, hidden 
                 </td>
               )}
               <td style={{ padding: '8px 12px', textAlign: 'right', ...monoGray }}>
-                {h.shares != null ? h.shares.toLocaleString('en-US', { maximumFractionDigits: 4 }) : '—'}
+                {hidden ? MASK : h.shares != null ? h.shares.toLocaleString('en-US', { maximumFractionDigits: 4 }) : '—'}
               </td>
               <td style={{ padding: '8px 12px', textAlign: 'right', ...monoGray }}>
-                {price != null ? '$' + price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—'}
+                {hidden ? MASK : price != null ? '$' + price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—'}
               </td>
               <td style={{ padding: '8px 12px', textAlign: 'right', fontFamily: "'JetBrains Mono', monospace", fontWeight: 500 }}>
                 {fmtOrMask(h.value_usd, hidden)}
@@ -156,11 +145,15 @@ function HoldingsTable({ holdings, showAccount, firmMap, portfolioTotal, hidden 
                   <div style={{ fontSize: 11, color: '#9A9490', fontWeight: 400 }}>{fmtPct(pct)}</div>
                 )}
               </td>
+              <td style={{ padding: '8px 12px', textAlign: 'right', ...monoGray }}>
+                {h.market_value_usd != null ? fmtOrMask(h.market_value_usd, hidden) : '—'}
+                {h.market_date && <div style={{ fontSize: 10, color: '#6B6460' }}>{h.market_date}</div>}
+              </td>
             </tr>
           )
         })}
       </tbody>
-    </table>
+    </table></div>
   )
 }
 
@@ -250,6 +243,7 @@ function CashFlowPanel({ accountName, hidden }: { accountName: string; hidden: b
     try {
       const cf = await api.cashFlows.add({ account_name: accountName, date: formDate, amount_usd: amount, note: formNote || undefined })
       setFlows(prev => [cf, ...(prev ?? [])])
+      window.dispatchEvent(new Event('portfolio-history-changed'))
       setShowForm(false)
       setFormAmount('')
       setFormNote('')
@@ -261,8 +255,11 @@ function CashFlowPanel({ accountName, hidden }: { accountName: string; hidden: b
   }
 
   const handleDelete = async (id: number) => {
-    await api.cashFlows.delete(id)
-    setFlows(prev => (prev ?? []).filter(f => f.id !== id))
+    try {
+      await api.cashFlows.delete(id)
+      setFlows(prev => (prev ?? []).filter(f => f.id !== id))
+      window.dispatchEvent(new Event('portfolio-history-changed'))
+    } catch (e) { setError(e instanceof Error ? e.message : '删除失败') }
   }
 
   return (
@@ -277,7 +274,7 @@ function CashFlowPanel({ accountName, hidden }: { accountName: string; hidden: b
         </button>
       </div>
 
-      {showForm && (
+      {showForm && !hidden && (
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 10, flexWrap: 'wrap' }}>
           <input type="date" value={formDate} onChange={e => setFormDate(e.target.value)}
             style={{ fontSize: 12, padding: '4px 8px', border: '1px solid #2A2826', borderRadius: 4, background: '#161616', color: '#E8E0D0' }} />
@@ -471,11 +468,9 @@ export default function PortfolioView({ portfolio, hidden }: Props) {
     })
   }
 
-  const portfolioTotal = accounts.reduce((s, a) => s + a.total_value_usd, 0)
-
-  const total = view === 'account'
-    ? portfolioTotal
-    : holdings.reduce((s, h) => s + h.value_usd, 0)
+  const portfolioTotal = portfolio.total_value_usd
+  const holdingsTotal = holdings.reduce((sum, h) => sum + h.value_usd, 0)
+  const total = portfolioTotal
 
   return (
     <div>
@@ -484,15 +479,11 @@ export default function PortfolioView({ portfolio, hidden }: Props) {
         <div style={{ fontSize: 36, fontWeight: 600, letterSpacing: -1, fontFamily: "'JetBrains Mono', monospace" }}>
           {fmtOrMask(total, hidden)}
         </div>
-        {view !== 'account' && portfolioTotal !== total && (
-          <div style={{ fontSize: 12, color: '#6B6460', marginTop: 4 }}>
-            仅含有持仓明细的账户（不含{' '}
-            {hidden
-              ? <span style={{ color: '#3A3228' }}>{MASK}</span>
-              : fmt(portfolioTotal - total)
-            }{' '}无持仓数据的账户）
-          </div>
-        )}
+        <div style={{ fontSize: 12, color: '#6B6460', marginTop: 4 }}>
+          账户总余额 · 持仓明细合计 {fmtOrMask(holdingsTotal, hidden)}
+          {Math.abs(holdingsTotal - portfolioTotal) >= 1 && <> · 与总余额相差 {fmtOrMask(portfolioTotal - holdingsTotal, hidden)}</>}
+        </div>
+        <div style={{ fontSize: 11, color: '#6B6460', marginTop: 4 }}>行情估值按最新可得收盘价 × 同步股数计算，仅供参考，未计入账户总余额。</div>
         {last_synced && (
           <div style={{ fontSize: 11, color: '#6B6460', marginTop: 4, fontFamily: "'JetBrains Mono', monospace" }}>
             上次同步：{new Date(last_synced.endsWith('Z') ? last_synced : last_synced + 'Z').toLocaleString('zh-CN')}
@@ -517,7 +508,7 @@ export default function PortfolioView({ portfolio, hidden }: Props) {
       </div>
 
       {/* Performance chart */}
-      <PerformanceChart />
+      <PerformanceChart hidden={hidden} revision={last_synced} />
 
       {/* Tab switcher */}
       <div style={{ display: 'flex', gap: 2, marginBottom: 14, background: '#1F1F1F', borderRadius: 7, padding: 3, width: 'fit-content' }}>
