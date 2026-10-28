@@ -4,7 +4,7 @@ import { useRetirementData } from './RetirementAccountTagger'
 import RetirementAccountTagger from './RetirementAccountTagger'
 import SpendingTimeline from './SpendingTimeline'
 import RetirementChart, { OutputCards, YearlyTable } from './RetirementChart'
-import { runMonteCarlo, fitSpendingPhases, ASSET_PARAMS, type SpendingPhase, type MonteCarloResult, type CustomAsset, type SocialSecurity } from './retirement'
+import { runMonteCarlo, fitSpendingPhases, resolveAssetParams, ASSET_PARAMS, type AssetClass, type AssetReturnRates, type SpendingPhase, type MonteCarloResult, type CustomAsset, type SocialSecurity } from './retirement'
 
 function migratePhase(p: SpendingPhase & { monthlySpend?: number }): SpendingPhase {
   const base = p.items ? p : {
@@ -38,6 +38,7 @@ interface ScenarioPayload {
   customAssets?: CustomAsset[]
   socialSecurity?: SocialSecurity[]
   inflationRate?: number
+  returnRates?: AssetReturnRates
 }
 
 function parsePayload(json: string): ScenarioPayload {
@@ -47,20 +48,23 @@ function parsePayload(json: string): ScenarioPayload {
     if (Array.isArray(parsed)) {
       return { phases: parsed.map(migratePhase) }
     }
-    // New: { phases, customAssets }
+    // Old scenarios inherit default returns. Invalid overrides must not erase budgets.
+    let returnRates = parsed.returnRates ?? {}
+    try { resolveAssetParams(returnRates) } catch { returnRates = {} }
     return {
       phases: (parsed.phases as SpendingPhase[]).map(migratePhase),
       customAssets: parsed.customAssets ?? [],
       socialSecurity: parsed.socialSecurity ?? [],
       inflationRate: parsed.inflationRate,
+      returnRates,
     }
   } catch {
     return { phases: makeDefaultPhases(DEFAULT_RETIREMENT_AGE, DEFAULT_MAX_AGE), customAssets: [] }
   }
 }
 
-function serializePayload(phases: SpendingPhase[], customAssets: CustomAsset[], socialSecurity: SocialSecurity[], inflationRate: number): string {
-  return JSON.stringify({ phases, customAssets, socialSecurity, inflationRate })
+function serializePayload(phases: SpendingPhase[], customAssets: CustomAsset[], socialSecurity: SocialSecurity[], inflationRate: number, returnRates: AssetReturnRates): string {
+  return JSON.stringify({ phases, customAssets, socialSecurity, inflationRate, returnRates })
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -262,6 +266,9 @@ export default function RetirementCalculator({ hidden }: Props) {
   const [withdrawalTaxRate, setWithdrawalTaxRate] = useState(DEFAULT_TAX_RATE)
   const [postRetirementEquity, setPostRetirementEquity] = useState(DEFAULT_POST_RETIREMENT_EQUITY)
   const [inflationRate, setInflationRate] = useState(DEFAULT_INFLATION_RATE)
+  const [returnRates, setReturnRates] = useState<AssetReturnRates>({})
+  const [returnResetVersion, setReturnResetVersion] = useState(0)
+  const assetParams = resolveAssetParams(returnRates)
   const [phases, setPhases] = useState<SpendingPhase[]>(
     makeDefaultPhases(DEFAULT_RETIREMENT_AGE, DEFAULT_MAX_AGE)
   )
@@ -290,12 +297,13 @@ export default function RetirementCalculator({ hidden }: Props) {
     setCustomAssets(payload.customAssets ?? [])
     setSocialSecurity(payload.socialSecurity ?? [])
     setInflationRate(payload.inflationRate ?? DEFAULT_INFLATION_RATE)
+    setReturnRates(payload.returnRates ?? {})
     saver.current.acknowledge(s.id, {
       current_age: s.current_age,
       retirement_age: s.retirement_age,
       max_age: s.max_age,
       monthly_contribution: s.monthly_contribution,
-      phases_json: serializePayload(payload.phases, payload.customAssets ?? [], payload.socialSecurity ?? [], payload.inflationRate ?? DEFAULT_INFLATION_RATE),
+      phases_json: serializePayload(payload.phases, payload.customAssets ?? [], payload.socialSecurity ?? [], payload.inflationRate ?? DEFAULT_INFLATION_RATE, payload.returnRates ?? {}),
       withdrawal_tax_rate: s.withdrawal_tax_rate ?? DEFAULT_TAX_RATE,
       post_retirement_equity_pct: s.post_retirement_equity_pct ?? DEFAULT_POST_RETIREMENT_EQUITY,
     })
@@ -335,7 +343,7 @@ export default function RetirementCalculator({ hidden }: Props) {
     retirement_age: retirementAge,
     max_age: maxAge,
     monthly_contribution: monthlyContribution,
-    phases_json: serializePayload(phases, customAssets, socialSecurity, inflationRate),
+    phases_json: serializePayload(phases, customAssets, socialSecurity, inflationRate, returnRates),
     withdrawal_tax_rate: withdrawalTaxRate,
     post_retirement_equity_pct: postRetirementEquity,
   }
@@ -446,6 +454,7 @@ export default function RetirementCalculator({ hidden }: Props) {
         retirementBalance: data.retirementTotal,
         monthlyContribution,
         holdingWeights: data.holdingWeights,
+        returnRates,
         customAssets,
         socialSecurity,
         inflationRate,
@@ -460,7 +469,7 @@ export default function RetirementCalculator({ hidden }: Props) {
     currentAgeValid, retirementAgeValid, data.loading,
     currentAge, retirementAge, maxAge,
     data.taxableTotal, data.retirementTotal,
-    monthlyContribution, data.holdingWeights, customAssets, socialSecurity, inflationRate, phases, withdrawalTaxRate, postRetirementEquity,
+    monthlyContribution, data.holdingWeights, returnRates, customAssets, socialSecurity, inflationRate, phases, withdrawalTaxRate, postRetirementEquity,
   ])
 
   useEffect(() => {
@@ -542,7 +551,7 @@ export default function RetirementCalculator({ hidden }: Props) {
       <details style={{ fontSize: 12, color: '#6B6460', marginBottom: 16, lineHeight: 1.7 }}>
         <summary style={{ cursor: 'pointer' }}>计算假设与数据来源</summary>
         <p>按年模拟，年初支出、年末投入。股债冲击按同一历史年份抽样，再缩放至假设的均值与波动率；不代表预测收益。</p>
-        <p>退休后权益假设：实际年均 {ASSET_PARAMS.equity.mean * 100}%，波动率 {ASSET_PARAMS.equity.std * 100}%；债券：实际年均 {ASSET_PARAMS.bond.mean * 100}%，波动率 {ASSET_PARAMS.bond.std * 100}%。通胀基准为 2.5%。</p>
+        <p>退休后权益假设：基准实际年均 {formatRate(assetParams.equity.mean)}%，波动率 {ASSET_PARAMS.equity.std * 100}%；债券：基准实际年均 {formatRate(assetParams.bond.mean)}%，波动率 {ASSET_PARAMS.bond.std * 100}%。通胀基准为 2.5%，可在下方修改回报率。</p>
         <p>社保金额按今日购买力，先抵扣支出；净支出再按综合税率折算。尚未逐项模拟 Roth、RMD、提前提款例外和房产出售税费。</p>
         <a href="https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/histretSP.html" target="_blank" rel="noreferrer" style={{ color: '#C8A96E' }}>NYU 历史收益数据（1928–2025，已逐年扣除通胀）</a>
       </details>
@@ -558,7 +567,7 @@ export default function RetirementCalculator({ hidden }: Props) {
           fontSize: 12, color: '#C8A96E',
           fontFamily: "'Space Grotesk', sans-serif",
         }}>
-          尚未同步数据，回报率使用默认值（均衡组合 6%/年），建议先同步 Empower。
+          尚未同步数据，退休前采用均衡组合的回报率假设（当前 {formatRate(assetParams.blended.mean)}%/年），可在下方修改，建议先同步 Empower。
         </div>
       )}
 
@@ -712,6 +721,27 @@ export default function RetirementCalculator({ hidden }: Props) {
         </div>
       </Section>
 
+      <Section title="投资回报率假设">
+        <p style={{ fontSize: 12, color: '#6B6460', lineHeight: 1.7, margin: '0 0 16px' }}>
+          填写扣除通胀后的年均回报率（算术均值，不是保证的复合年化收益）。退休前按当前持仓类别使用；退休后使用股票（宽基）和债券，按上方权益比例组合。房产等其他资产使用各自的回报率。
+        </p>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 144px), 1fr))', gap: 16 }}>
+          {(Object.keys(RETURN_LABELS) as AssetClass[]).map(cls => (
+            <ReturnRateField
+              key={`${loadedId}-${returnResetVersion}-${cls}`}
+              label={RETURN_LABELS[cls]}
+              value={assetParams[cls].mean}
+              defaultValue={ASSET_PARAMS[cls].mean}
+              onChange={rate => setReturnRates(prev => ({ ...prev, [cls]: rate }))}
+            />
+          ))}
+        </div>
+        <p style={{ fontSize: 12, color: '#6B6460', lineHeight: 1.7, margin: '16px 0' }}>
+          以上按 2.5% 基准通胀填写。沿用现有模型：通胀假设每高出基准 1 个百分点，模拟实际回报率下调 1 个百分点；低于基准则上调。波动率和历史抽样方式不变。
+        </p>
+        <button type="button" onClick={() => { setReturnRates({}); setReturnResetVersion(version => version + 1) }} style={stepBtnStyle}>恢复默认回报率</button>
+      </Section>
+
       {/* ── Section: 支出规划 ── */}
       <Section title="支出规划（拖拽分界线调整阶段）">
         {currentAgeValid && retirementAgeValid ? (
@@ -739,10 +769,48 @@ export default function RetirementCalculator({ hidden }: Props) {
             <RetirementChart result={mcResult} retirementAge={retirementAge} />
             <YearlyTable result={mcResult} retirementAge={retirementAge} />
           </>
-        ) : <p style={{ color: '#6B6460', fontSize: 12 }}>计算中，或参数无效；请检查年龄、阶段重叠和非负金额。</p>}
+        ) : <p style={{ color: '#6B6460', fontSize: 12 }}>计算中，或参数无效；请检查年龄、回报率、阶段重叠和非负金额。</p>}
       </Section>
     </fieldset>
   )
+}
+
+const RETURN_LABELS: Record<AssetClass, string> = {
+  equity: '股票（宽基）', bond: '债券', tech_fund: '科技基金', small_cap: '小盘股基金',
+  individual_stock: '美国个股', international: '国际股票基金', intl_stock: '国际个股',
+  cash: '现金', crypto: '加密资产', gold: '黄金', alternative: '另类资产', blended: '均衡／未分类组合',
+}
+
+function formatRate(rate: number): string {
+  return String(Math.round(rate * 10000) / 100)
+}
+
+function ReturnRateField({ label, value, defaultValue, onChange }: {
+  label: string; value: number; defaultValue: number; onChange: (rate: number) => void
+}) {
+  const [text, setText] = useState(() => formatRate(value))
+  useEffect(() => { setText(formatRate(value)) }, [value])
+  const valid = text.trim() !== '' && Number.isFinite(Number(text)) && Number(text) > -100 && Number(text) <= 100
+  return <div>
+    <label style={labelStyle()}>
+      <span style={{ display: 'block', marginBottom: 4 }}>{label}</span>
+      <input
+        aria-label={`${label}年均回报率`}
+        aria-invalid={!valid}
+        type="number" min="-99.9" max="100" step="0.1"
+        style={inputStyle(!valid)} value={text}
+        onChange={event => {
+          const next = event.target.value
+          setText(next)
+          const rate = event.target.valueAsNumber / 100
+          if (Number.isFinite(rate) && rate > -1 && rate <= 1) onChange(rate)
+        }}
+      /> <span>%</span>
+    </label>
+    <div style={{ fontSize: 11, color: valid ? '#6B6460' : '#C06B5A', marginTop: 4 }}>
+      {valid ? `默认 ${formatRate(defaultValue)}%` : '未应用：请输入大于 -100%、不超过 100% 的数值'}
+    </div>
+  </div>
 }
 
 // ─── CustomAssetEditor ────────────────────────────────────────────────────────

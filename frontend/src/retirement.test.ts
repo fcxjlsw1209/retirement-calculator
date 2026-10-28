@@ -7,6 +7,9 @@ import {
   computePlanningRequired,
   checkBridgeGap,
   ASSET_PARAMS,
+  resolveAssetParams,
+  type AssetClass,
+  type AssetReturnRates,
   type SpendingPhase,
   type RetirementParams,
 } from './retirement'
@@ -30,6 +33,85 @@ const BASE_PARAMS: RetirementParams = {
   spendingPhases: makePhases(65, 90, 5_000),
   simCount: 1000,
 }
+
+describe('configurable return rates', () => {
+  const oneYear = { ...BASE_PARAMS, currentAge: 40, retirementAge: 41, maxAge: 42,
+    taxableBalance: 100_000, retirementBalance: 0, monthlyContribution: 0,
+    spendingPhases: [], simCount: 100 }
+
+  it('keeps legacy scenarios identical when defaults are explicitly supplied', () => {
+    const returnRates = Object.fromEntries(Object.entries(ASSET_PARAMS).map(([cls, p]) => [cls, p.mean]))
+    expect(runMonteCarlo({ ...BASE_PARAMS, returnRates })).toEqual(runMonteCarlo(BASE_PARAMS))
+    expect(runMonteCarlo({ ...BASE_PARAMS, returnRates: {} })).toEqual(runMonteCarlo(BASE_PARAMS))
+  })
+
+  it.each(Object.keys(ASSET_PARAMS) as AssetClass[])('uses the %s override before retirement', cls => {
+    const params = { ...oneYear, holdingWeights: { [cls]: 1 } }
+    const original = runMonteCarlo(params)
+    const updated = runMonteCarlo({ ...params, returnRates: { [cls]: ASSET_PARAMS[cls].mean + 0.01 } })
+    expect(updated.p50[1]).toBeGreaterThan(original.p50[1])
+  })
+
+  it.each([['equity', 0.6], ['bond', 0.4]] as const)('uses the %s override in the retirement allocation', (cls, weight) => {
+    const params = { ...oneYear, currentAge: 41, postRetirementEquityPct: 0.6 }
+    const original = runMonteCarlo(params)
+    const updated = runMonteCarlo({ ...params, returnRates: { [cls]: ASSET_PARAMS[cls].mean + 0.01 } })
+    expect(updated.p50[1] - original.p50[1]).toBeCloseTo(100_000 * weight * 0.01, 6)
+    expect(updated.p90[1] - updated.p10[1]).toBeCloseTo(original.p90[1] - original.p10[1], 6)
+  })
+
+  it('does not use pre-retirement sector overrides after retirement', () => {
+    const params = { ...oneYear, currentAge: 41 }
+    expect(runMonteCarlo({ ...params, returnRates: { tech_fund: 0.01, individual_stock: 0.02 } }))
+      .toEqual(runMonteCarlo(params))
+  })
+
+  it('uses overrides in the reference gap as well as simulation paths', () => {
+    const params = { ...oneYear, currentAge: 40, retirementAge: 40, maxAge: 42,
+      taxableBalance: 0, spendingPhases: makePhases(40, 42, 1000), postRetirementEquityPct: 0.6 }
+    expect(runMonteCarlo({ ...params, returnRates: { equity: 0, bond: 0 } }).medianGapToRetirement).toBe(24_000)
+    expect(runMonteCarlo({ ...params, returnRates: { equity: 0.1, bond: 0 } }).medianGapToRetirement)
+      .toBeCloseTo(12_000 + 12_000 / 1.06, 6)
+  })
+
+  it.each([0, -0.01])('keeps a %s cash rate in accumulation and the bridge estimate', rate => {
+    const params = { ...oneYear, retirementAge: 45, maxAge: 46,
+      holdingWeights: { cash: 1 }, returnRates: { cash: rate } }
+    const expected = 100_000 * (1 + rate) ** 5
+    expect(runMonteCarlo(params).p50[5]).toBeCloseTo(expected, 6)
+    expect(checkBridgeGap(params, []).taxableAtRetirement).toBeCloseTo(expected, 6)
+  })
+
+  it('applies the existing inflation adjustment once to configured real returns', () => {
+    const result = runMonteCarlo({ ...oneYear, holdingWeights: { cash: 1 },
+      returnRates: { cash: 0.02 }, inflationRate: 0.035 })
+    expect(result.p50[1]).toBeCloseTo(101_000, 6)
+  })
+
+  it('does not change other scenarios, custom asset rates, or default volatility', () => {
+    const original = runMonteCarlo(oneYear)
+    runMonteCarlo({ ...oneYear, returnRates: { equity: 0.01, bond: 0 } })
+    expect(runMonteCarlo(oneYear)).toEqual(original)
+    expect(resolveAssetParams({ equity: 0.01 }).equity).toEqual({ mean: 0.01, std: ASSET_PARAMS.equity.std })
+    expect(ASSET_PARAMS.equity.mean).toBe(0.07)
+    const params = { ...oneYear, taxableBalance: 0,
+      customAssets: [{ id: 'custom', name: 'Custom', value: 100_000, mean: 0.03, std: 0, availableForSpending: true }] }
+    expect(runMonteCarlo({ ...params, returnRates: { equity: 0 } }).p50[1]).toBe(103_000)
+  })
+
+  it.each([NaN, Infinity, -Infinity, -1, 1.01])('rejects invalid return rate %s', rate => {
+    expect(() => runMonteCarlo({ ...oneYear, returnRates: { equity: rate } })).toThrow(RangeError)
+  })
+
+  it('rejects unknown asset classes in return overrides', () => {
+    expect(() => resolveAssetParams({ unknown: 0.05 } as AssetReturnRates)).toThrow(RangeError)
+  })
+
+  it('rejects a mean return at or below -100% after the inflation adjustment', () => {
+    expect(() => runMonteCarlo({ ...oneYear, inflationRate: 0.15,
+      returnRates: { equity: -0.9, bond: -0.9 } })).toThrow(RangeError)
+  })
+})
 
 // ─── Ages array ────────────────────────────────────────────────────────────────
 

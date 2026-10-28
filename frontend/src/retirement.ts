@@ -18,6 +18,7 @@ export type AssetClass =
   | 'blended'          // Target date, thematic, unknown
 
 export type AssetClassWeights = Partial<Record<AssetClass, number>>
+export type AssetReturnRates = Partial<Record<AssetClass, number>>
 
 export interface SpendingItem {
   id: string
@@ -81,6 +82,7 @@ export interface RetirementParams {
   retirementBalance: number
   monthlyContribution: number
   holdingWeights: AssetClassWeights
+  returnRates?: AssetReturnRates // real annual arithmetic means at baseline inflation
   customAssets?: CustomAsset[]
   socialSecurity?: SocialSecurity[]  // one entry per person (user + spouse)
   inflationRate: number     // default 0.025
@@ -126,6 +128,18 @@ export const ASSET_PARAMS: Record<AssetClass, { mean: number; std: number }> = {
   blended:          { mean: 0.06,  std: 0.12  },  // target date, thematic, unknown
 }
 
+// Resolve per-scenario means without changing shared defaults or volatility.
+export function resolveAssetParams(returnRates: AssetReturnRates = {}): typeof ASSET_PARAMS {
+  if (!returnRates || typeof returnRates !== 'object' || Array.isArray(returnRates) ||
+      Object.entries(returnRates).some(([cls, rate]) =>
+        !Object.prototype.hasOwnProperty.call(ASSET_PARAMS, cls) || !Number.isFinite(rate) || rate <= -1 || rate > 1)) {
+    throw new RangeError('Annual return rates must be greater than -100% and at most 100%')
+  }
+  return Object.fromEntries(Object.entries(ASSET_PARAMS).map(([cls, params]) => [cls, {
+    ...params, mean: returnRates[cls as AssetClass] ?? params.mean,
+  }])) as typeof ASSET_PARAMS
+}
+
 // Paired real annual returns preserve equity/bond dependence. Means and standard
 // deviations below are scenario assumptions, not forecasts inferred from history.
 const SP500_REAL = HISTORICAL_RETURNS.map(([, equity, , inflation]) => (1 + equity) / (1 + inflation) - 1)
@@ -164,6 +178,7 @@ function bootstrapPortfolioReturn(
   customTotal: number,
   inflationAdj: number,
   random: Random,
+  assetParams: typeof ASSET_PARAMS,
 ): number {
   const { zEquity, zBond } = drawHistoricalYear(random)
   const grandTotal = portfolioValue + customTotal
@@ -175,7 +190,7 @@ function bootstrapPortfolioReturn(
   for (const cls of Object.keys(ASSET_PARAMS) as AssetClass[]) {
     const independent = randn(random)
     const w = effectiveWeights[cls] ?? 0
-    const p = ASSET_PARAMS[cls]
+    const p = assetParams[cls]
     let z: number
     if (cls === 'bond') z = zBond
     else if (cls === 'cash') z = 0
@@ -195,10 +210,10 @@ function bootstrapPortfolioReturn(
   return ret
 }
 
-function bootstrapBlendReturn(eqPct: number, bdPct: number, inflationAdj: number, random: Random): number {
+function bootstrapBlendReturn(eqPct: number, bdPct: number, inflationAdj: number, random: Random, assetParams: typeof ASSET_PARAMS): number {
   const { zEquity, zBond } = drawHistoricalYear(random)
-  return eqPct * (ASSET_PARAMS.equity.mean + ASSET_PARAMS.equity.std * zEquity + inflationAdj)
-    + bdPct * (ASSET_PARAMS.bond.mean + ASSET_PARAMS.bond.std * zBond + inflationAdj)
+  return eqPct * (assetParams.equity.mean + assetParams.equity.std * zEquity + inflationAdj)
+    + bdPct * (assetParams.bond.mean + assetParams.bond.std * zBond + inflationAdj)
 }
 
 function percentile(sorted: number[], p: number): number {
@@ -235,11 +250,12 @@ function computeBlendedParams(
   weights: AssetClassWeights,
   portfolioValue: number,
   customAssets: CustomAsset[] = [],
+  assetParams: typeof ASSET_PARAMS = ASSET_PARAMS,
 ): { mean: number; std: number } {
   const holdingWeight = Object.values(weights).reduce((s, w) => s + (w ?? 0), 0)
   const customTotal = customAssets.reduce((s, a) => s + a.value, 0)
   const grandTotal = portfolioValue + customTotal
-  if (grandTotal === 0) return ASSET_PARAMS.blended
+  if (grandTotal === 0) return assetParams.blended
 
   // Portfolio holdings contribution (already normalized weights → scale by portfolioValue share)
   let mean = 0
@@ -249,7 +265,7 @@ function computeBlendedParams(
   for (const [cls, w] of Object.entries(weights) as [AssetClass, number | undefined][]) {
     if (!w) continue
     const normW = (w / holdingWeight) * portfolioShare
-    const p = ASSET_PARAMS[cls]
+    const p = assetParams[cls]
     mean += normW * p.mean
     varSum += (normW * p.std) ** 2
   }
@@ -262,7 +278,8 @@ function computeBlendedParams(
     varSum += (normW * asset.std) ** 2
   }
 
-  return mean === 0 ? ASSET_PARAMS.blended : { mean, std: Math.sqrt(varSum) }
+  // Zero is a valid configured return. Only missing allocations use the fallback.
+  return holdingWeight === 0 && customTotal === 0 ? assetParams.blended : { mean, std: Math.sqrt(varSum) }
 }
 
 // Returns annual SS income in today's dollars. SS is COLA-adjusted, so in real terms
@@ -387,6 +404,7 @@ export function computeHoldingWeights(
 }
 
 export function runMonteCarlo(params: RetirementParams): MonteCarloResult {
+  const assetParams = resolveAssetParams(params.returnRates)
   const {
     currentAge, retirementAge, maxAge,
     taxableBalance, retirementBalance,
@@ -432,13 +450,16 @@ export function runMonteCarlo(params: RetirementParams): MonteCarloResult {
   const inflationAdj = -(inflationRate - BASELINE_INFLATION)
 
   // Pre-retirement: blended mean used only for threshold/yearsToRetirement computation
-  const { mean: blendedMeanBase } = computeBlendedParams(holdingWeights, taxableBalance + retirementBalance, customAssets)
+  const { mean: blendedMeanBase } = computeBlendedParams(holdingWeights, taxableBalance + retirementBalance, customAssets, assetParams)
   const blendedMean = blendedMeanBase + inflationAdj
 
   // Post-retirement: user-specified equity/bond mix (default 60/40)
   const eqPct = postRetirementEquityPct ?? 0.6
   const bdPct = 1 - eqPct
-  const postMean = eqPct * ASSET_PARAMS.equity.mean + bdPct * ASSET_PARAMS.bond.mean + inflationAdj
+  const postMean = eqPct * assetParams.equity.mean + bdPct * assetParams.bond.mean + inflationAdj
+  if (blendedMean <= -1 || postMean <= -1) {
+    throw new RangeError('Inflation-adjusted mean returns must be greater than -100%')
+  }
 
   // Discount post-retirement spending at post-retirement mean for threshold
   const retirementThreshold = computeRetirementThreshold(
@@ -493,13 +514,13 @@ export function runMonteCarlo(params: RetirementParams): MonteCarloResult {
         let annualReturn: number
         if (age >= retirementAge) {
           // Post-retirement: equity/bond blend via bootstrap
-          annualReturn = bootstrapBlendReturn(eqPct, bdPct, inflationAdj, random)
+          annualReturn = bootstrapBlendReturn(eqPct, bdPct, inflationAdj, random, assetParams)
         } else {
           // Pre-retirement: bootstrap per asset class with equity correlation
           annualReturn = bootstrapPortfolioReturn(
             holdingWeights, customAssets,
             taxableBalance + retirementBalance, customTotal,
-            inflationAdj, random,
+            inflationAdj, random, assetParams,
           )
         }
         taxable = Math.max(0, taxable * (1 + annualReturn))
@@ -590,7 +611,7 @@ export function checkBridgeGap(
     holdingWeights, inflationRate, effectiveTaxRate,
   } = params
   const taxGrossUp = 1 / (1 - effectiveTaxRate)
-  const { mean: blendedMeanBase } = computeBlendedParams(holdingWeights, taxableBalance + (params.retirementBalance ?? 0))
+  const { mean: blendedMeanBase } = computeBlendedParams(holdingWeights, taxableBalance + (params.retirementBalance ?? 0), [], resolveAssetParams(params.returnRates))
   const blendedMean = blendedMeanBase - (inflationRate - 0.025)
   const n = retirementAge - currentAge
 
